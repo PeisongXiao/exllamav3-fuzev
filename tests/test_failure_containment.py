@@ -44,6 +44,7 @@ class StubJob:
         self.sequences = [StubSequence()]
         self.serial_number = None
         self.identifier = name
+        self.readout = False
         self.deallocated = False
 
     def current_new_pages_required(self):

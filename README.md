@@ -1,9 +1,83 @@
+# ExLlamaV3 FuZev Fork
+
+ExLlamaV3 with hooks that let FuZev read the model's final hidden state for
+Choice, yes/no and ordered Score decisions alongside ordinary generation.
+The [FuZev integration](https://github.com/PeisongXiao/fuzev-exllamav3-plugin)
+loads the [decision head](https://huggingface.co/peisongxiao/Qwen3.8-Flash-Next-FuZev)
+and serves the API. The [FuZev index](https://github.com/PeisongXiao/fuzev)
+describes the components and models.
+
+**Contents**
+
+- [Install This Fork](#install-this-fork)
+- [Add Decisions](#add-decisions)
+- [Prefill Optimizations](#prefill-optimizations)
+- [Changes from upstream](doc/fuzev-fork.md)
+- [Upstream Documentation](#upstream-documentation)
+
+## Install This Fork
+
+Version `1.5.2+fuzev.v1.0`, based on upstream ExLlamaV3 `1.5.2`.
+
+Requirements:
+
+- Python 3.10.11 or later (tested with 3.12)
+- An NVIDIA CUDA GPU with a compatible driver
+- A CUDA toolkit whose `nvcc` CUDA version is compatible with the selected Torch build
+- Python development headers and a C++ compiler
+
+Follow the canonical [environment setup](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#create-an-environment)
+and [ExLlamaV3 engine build](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#exllamav3).
+The guide also covers CUDA 13 headers, other toolkit layouts, build
+architectures and [release wheels](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#local-release-wheels).
+
+## Add Decisions
+
+In the same active environment, install the shared runtime and ExLlamaV3
+integration with the canonical
+[decision integration step](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#exllamav3-with-exl3).
+Then follow the [integration guide](https://github.com/PeisongXiao/fuzev-exllamav3-plugin)
+for the head bundle, model configuration and server startup.
+
+The integration submits decision jobs to the Generator that serves generation,
+reusing its tokenizer, caches and scheduler. It can also add decision routes to
+an application's existing Generator.
+
+- [Generator readout](doc/fuzev-generator.md): the Python integration.
+- [API guide](https://github.com/PeisongXiao/fuzev/blob/main/docs/api.md): the client contract, image input and retained prefixes.
+
+## Prefill Optimizations
+
+Prefill optimizations are on by default when a model is built.
+
+- **Chunk size:** pass `max_chunk_size=8192` to `model.load()` and the
+  Generator to reach the measured throughput.
+- **Plain path:** set `EXLLAMAV3_NO_PREFILL_OPTIMIZATIONS=1` before the process
+  builds its first model. It applies to the whole process.
+- **GPU fallback:** if FlashInfer's gated-delta-network (GDN) prefill does not
+  support the GPU, GDN layers use the native scan on that device.
+- **Tuning:** call `enable_prefill_optimizations(options)` before model
+  construction. See the [optimization guide](doc/fuzev-fork.md#prefill-optimizations).
+
+Written by Peisong Xiao for ExLlamaV3; derived files retain turboderp's MIT
+copyright ([LICENSE](LICENSE)). Serving behavior and quality are in the
+[FuZev integration](https://github.com/PeisongXiao/fuzev/blob/main/docs/integration.md) and
+[benchmarks](https://github.com/PeisongXiao/fuzev/blob/main/docs/benchmarks.md).
+
+## Upstream Documentation
+
+The following overview and installation material describe upstream ExLlamaV3.
+Its package, wheel and clone commands install upstream. Use
+[Install This Fork](#install-this-fork) for the FuZev build.
+
+<details>
+<summary>Upstream overview, installation, examples and acknowledgements</summary>
 
 <p align="center">
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
-[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
+[Upstream installation](#upstream-installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
@@ -20,7 +94,7 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
   <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
-## Installation
+## Upstream Installation
 
 Start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later) since the Torch dependency is not automatically handled by `pip`. Then pick a method below:
 
@@ -159,7 +233,7 @@ installations once the venv is active, `python convert.py -i ...`
 
 **Build environment variables**
 
-- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for 
+- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for
 compilation. Set this to a reasonable value like 4 in that case.
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch
 will build/load it at runtime instead.
@@ -305,4 +379,26 @@ supporters (🐈❤️!) The following projects in particular deserve a special 
   <img src="doc/cat.png" width="40" alt="">
 </p>
 
+</details>
 
+## Limitations
+
+FuZev v1.0 is an experimental research release. ExLlamaV3 readout currently
+supports Generators without tensor parallelism; multi-GPU layer splits are
+untested. The [API limitations](https://github.com/PeisongXiao/fuzev/blob/main/docs/api.md#limitations) describe option
+counts and image scope.
+
+Images are experimental. Retained prefixes from generation requests that
+included an image keep the image embeddings with the accepted tokens.
+Image requests have CPU-only coverage; visual decision quality is limited
+([benchmarks](https://github.com/PeisongXiao/fuzev/blob/main/docs/benchmarks.md#full-held-out-visual-comparison)).
+
+The prefill optimizations are tuned and tested on GB10 with
+Qwen3.8-Flash-Next EXL3; on other GPUs or models, compare against
+`EXLLAMAV3_NO_PREFILL_OPTIMIZATIONS=1`.
+
+Tested on NVIDIA GB10 (Python 3.12, PyTorch 2.13.0+cu130).
+See [source-installation checks](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#verified-source-installations).
+The [fork limitations](doc/fuzev-fork.md#limitations) give the results scope,
+run-to-run variation and the CUDA 12.4 driver requirement for CUDA graph
+argument patching.

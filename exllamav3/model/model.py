@@ -1,6 +1,7 @@
 from __future__ import annotations
 from functools import cached_property
 from typing import Callable
+import os
 import torch
 from .config import Config
 from ..util import parse_int_list
@@ -169,6 +170,10 @@ class Model(Model_TPMixin, Model_LSMixin):
         :param component:
             Which component model to load, for models with multiple component.
         """
+
+        if os.environ.get("EXLLAMAV3_NO_PREFILL_OPTIMIZATIONS") != "1":
+            from ..optimized import enable_prefill_optimizations
+            enable_prefill_optimizations()
 
         assert component in config.model_classes, \
             f"{config.architecture} does not define a '{component}' component model"
@@ -399,6 +404,22 @@ class Model(Model_TPMixin, Model_LSMixin):
             y = self.forward_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
+
+
+    @torch.inference_mode
+    def forward_features(self, input_ids, params=None):
+        """Returns FP32 last-token features that own their storage."""
+        if self.loaded_tp:
+            raise NotImplementedError("Feature capture does not currently support tensor parallelism")
+        params = {} if params is None else params
+        params["_fuzev_features"] = True
+        try:
+            features = self.forward(input_ids, params)
+            if features.ndim != 3 or features.shape[-1] != self.config.hidden_size:
+                raise RuntimeError("Final hidden state has an unexpected shape")
+            return features[:, -1:].to(dtype=torch.float32, copy=True)
+        finally:
+            params.pop("_fuzev_features", None)
 
 
     def unload(self):

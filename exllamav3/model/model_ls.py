@@ -347,9 +347,10 @@ class Model_LSMixin(ABC):
             h.begin_pass()
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
+            if module.caps.get("logits_output") and params.get("_fuzev_features"):
+                return x
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
                 x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
-

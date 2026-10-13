@@ -11,14 +11,14 @@
 #define DRV_STR2(x) #x
 #define DRV_STR(x) DRV_STR2(x)
 
-static void* drv_sym(void* lib, const char* name)
+static void* drv_sym(void* lib, const char* name, bool required = true)
 {
     #ifdef _WIN32
         void* fp = (void*) GetProcAddress((HMODULE) lib, name);
     #else
         void* fp = dlsym(lib, name);
     #endif
-    TORCH_CHECK(fp, "CUDA driver symbol not found: ", name);
+    TORCH_CHECK(fp || !required, "CUDA driver symbol not found: ", name);
     return fp;
 }
 
@@ -39,6 +39,7 @@ const CudaDrv& CudaDrv::instance()
         d.module_unload                     = (decltype(&cuModuleUnload))                 drv_sym(lib, DRV_STR(cuModuleUnload));
         d.module_get_function               = (decltype(&cuModuleGetFunction))            drv_sym(lib, DRV_STR(cuModuleGetFunction));
         d.func_set_attribute                = (decltype(&cuFuncSetAttribute))             drv_sym(lib, DRV_STR(cuFuncSetAttribute));
+        d.func_get_param_info               = (decltype(&cuFuncGetParamInfo))              drv_sym(lib, DRV_STR(cuFuncGetParamInfo), false);
         d.launch_kernel                     = (decltype(&cuLaunchKernel))                 drv_sym(lib, DRV_STR(cuLaunchKernel));
         d.graph_kernel_node_get_params      = (decltype(&cuGraphKernelNodeGetParams))     drv_sym(lib, DRV_STR(cuGraphKernelNodeGetParams));
         d.graph_exec_kernel_node_set_params = (decltype(&cuGraphExecKernelNodeSetParams)) drv_sym(lib, DRV_STR(cuGraphExecKernelNodeSetParams));

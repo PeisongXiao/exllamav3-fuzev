@@ -1,0 +1,11 @@
+{
+  "options": {
+    "qsa_stage": true,
+    "moe_impl": "folded-hot",
+    "moe_batch_cap": 8,
+    "moe_max_rows": 16384,
+    "gdn_native_layers": [0],
+    "prefill_min_rows": 256,
+    "bmm_tile": [64, 128, 64, 3]
+  }
+}

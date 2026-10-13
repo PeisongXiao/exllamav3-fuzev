@@ -61,6 +61,7 @@ void Graph::capture_end()
     node_params.resize(num_nodes);
     node_params_drv.resize(num_nodes);
     node_is_driver.resize(num_nodes);
+    node_args.resize(num_nodes);
     node_needs_update.resize(num_nodes);
     for (int i = 0; i < num_nodes; ++i)
         node_needs_update[i] = false;
@@ -91,6 +92,7 @@ void Graph::capture_end()
                 node_func = (void*) node_params_drv[n].func;
             }
 
+            size_t first_site = graph_node_sites.size();
             for(; c < graph_sites.size(); c++)
             {
                 void* func = std::get<0>(graph_sites[c]);
@@ -102,6 +104,20 @@ void Graph::capture_end()
 
                 graph_node_sites.push_back(std::tuple<int, int, int, int>(n, param_id, param_offset, param_size));
                 if (param_id == GP_end) { c++; break; }
+            }
+
+            if (graph_node_sites.size() != first_site)
+            {
+                own_node_params(n);
+                for (size_t s = first_site; s < graph_node_sites.size(); ++s)
+                {
+                    auto [node_idx, param_id, param_offset, param_size] = graph_node_sites[s];
+                    if (param_id == GP_end) continue;
+                    TORCH_CHECK(param_offset >= 0 && param_offset < node_args[n].values.size() &&
+                                param_size > 0 && param_size <= sizeof(void*) &&
+                                param_size <= node_args[n].values[param_offset].size(),
+                                "Graph recording failed: invalid kernel parameter size or index");
+                }
             }
         }
 
@@ -124,6 +140,44 @@ void Graph::capture_end()
 void Graph::record_param(void* kernel, int param_id, int param_offset, int size)
 {
     graph_sites.push_back(std::tuple<void*, int, int, int>(kernel, param_id, param_offset, size));
+}
+
+void Graph::own_node_params(int node_idx)
+{
+    void**& params = node_is_driver[node_idx] ?
+        node_params_drv[node_idx].kernelParams : node_params[node_idx].kernelParams;
+    TORCH_CHECK(params, "Graph recording requires kernelParams for patchable nodes");
+    auto& args = node_args[node_idx];
+
+    // Copy every argument, including unpatched trailing scalars. GetParams' pointer array
+    // and pointees belong to CUDA; neither may be used as mutable update storage.
+    for (size_t i = 0; ; ++i)
+    {
+        size_t offset, size;
+        if (node_is_driver[node_idx])
+        {
+            TORCH_CHECK(CudaDrv::instance().func_get_param_info,
+                "CUDA graph argument patching needs a driver with cuFuncGetParamInfo (CUDA 12.4 or newer)");
+            CUresult r = CudaDrv::instance().func_get_param_info(node_params_drv[node_idx].func, i, &offset, &size);
+            if (r == CUDA_ERROR_INVALID_VALUE) break;  // end of the kernel signature
+            cuda_check_drv(r);
+        }
+        else
+        {
+            cudaError_t r = cudaFuncGetParamInfo(node_params[node_idx].func, i, &offset, &size);
+            if (r == cudaErrorInvalidValue)
+            {
+                (void) cudaGetLastError();
+                break;
+            }
+            cuda_check(r);
+        }
+        const char* src = (const char*) params[i];
+        args.values.emplace_back(src, src + size);
+    }
+    args.ptrs.reserve(args.values.size());
+    for (auto& value : args.values) args.ptrs.push_back(value.data());
+    params = args.ptrs.data();
 }
 
 void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)

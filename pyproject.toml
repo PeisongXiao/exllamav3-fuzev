@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10.11"
 license = "MIT"
 authors = [{ name = "turboderp" }]
+maintainers = [{ name = "Peisong Xiao" }]
 keywords = ["llm", "inference", "gpu", "quantization", "llama"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -28,6 +29,7 @@ dependencies = [
     "marisa_trie",
     "pydantic",
     "llguidance>=1.7.0",
+    "flashinfer-python; platform_system == 'Linux'",
     "triton-windows; platform_system == 'Windows'",
 ]
 
@@ -74,16 +76,15 @@ cu132 = [
 package-dir = { "" = "." }
 include-package-data = true
 
-[tool.setuptools.packages.find]
-include = ["exllamav3*"]
-
 [tool.setuptools.package-data]
 exllamav3 = [
     "py.typed",
     "util/hadamard_data/*",
     "conversion/standard_cal_data/*.utf8",
     "exllamav3_ext/**/*",
+    "vendor/fla/LICENSE",
 ]
+"exllamav3.optimized" = ["profile.json", "LICENSE"]
 
 [tool.setuptools.dynamic]
 version = { attr = "exllamav3.version.__version__" }

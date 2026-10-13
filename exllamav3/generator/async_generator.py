@@ -87,7 +87,11 @@ class AsyncGenerator:
         # land in. The sync generator still owns scheduling and serial assignment.
         assert job.job not in self.jobs
         self.jobs[job.job] = job
-        self.generator.enqueue(job.job)
+        try:
+            self.generator.enqueue(job.job)
+        except Exception:
+            del self.jobs[job.job]
+            raise
 
         # Condition.notify_all() must run while holding the condition lock, so schedule a tiny coroutine instead of
         # trying to notify directly from this synchronous method.
@@ -136,8 +140,18 @@ class AsyncJob:
     Async wrapper for dynamic generator job. See definition of Job.
     """
     def __init__(self, generator: AsyncGenerator, *args: object, **kwargs: object):
+        self._attach(generator, Job(*args, **kwargs))
+
+    @classmethod
+    def from_job(cls, generator: AsyncGenerator, job: Job):
+        """Submit a prepared job to a running AsyncGenerator."""
+        value = cls.__new__(cls)
+        value._attach(generator, job)
+        return value
+
+    def _attach(self, generator, job):
         self.generator = generator
-        self.job = Job(*args, **kwargs)
+        self.job = job
         # The queue is unbounded and written with put_nowait: the shared iteration task must never block on a
         # consumer that stopped draining (see _run_iteration). Growth is paced by the sync generator's own token
         # rate and ends when the job completes or is cancelled, which is the frontend's responsibility on client

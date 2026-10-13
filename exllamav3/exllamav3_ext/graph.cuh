@@ -117,6 +117,13 @@ public:
     // runtime API ("invalid device function"); their params live here instead
     std::vector<CUDA_KERNEL_NODE_PARAMS> node_params_drv;
     std::vector<char> node_is_driver;
+    // GetParams returns node-owned storage, which must not be modified during replay.
+    struct KernelArgs
+    {
+        std::vector<std::vector<char>> values;
+        std::vector<void*> ptrs;
+    };
+    std::vector<KernelArgs> node_args;
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
 
@@ -132,6 +139,7 @@ public:
     void capture_end();
 
     void record_param(void* kernel, int param_id, int param_offset, int size = 8);
+    void own_node_params(int node_idx);
     void launch(std::vector<PPTR> params, cudaStream_t stream);
 
     void inspect_graph();

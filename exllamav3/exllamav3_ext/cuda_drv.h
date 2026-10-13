@@ -13,6 +13,7 @@ struct CudaDrv
     decltype(&cuModuleUnload)                   module_unload;
     decltype(&cuModuleGetFunction)              module_get_function;
     decltype(&cuFuncSetAttribute)               func_set_attribute;
+    decltype(&cuFuncGetParamInfo)               func_get_param_info;
     decltype(&cuLaunchKernel)                   launch_kernel;
     decltype(&cuGraphKernelNodeGetParams)       graph_kernel_node_get_params;
     decltype(&cuGraphExecKernelNodeSetParams)   graph_exec_kernel_node_set_params;

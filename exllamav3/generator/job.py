@@ -65,6 +65,9 @@ class Job:
         max_rq_tokens: int | None = None,
         stop_on_loop: tuple[int, int] = None,
         rq_state: dict | None = None,
+        readout: bool = False,
+        retain_decision_prefix: bool = False,
+        checkpoint: bool = True,
         **kwargs
     ):
         """
@@ -140,8 +143,27 @@ class Job:
         :param rq_state:
             Internal, passed when job requeues itself
 
+        :param readout:
+            Consume the input and return final hidden-state features. Sets max_new_tokens=0
+            and uses the generator's prefix/recurrent and paired MTP caches.
+
+        :param retain_decision_prefix:
+            Include an owned CPU sequence_ids tensor on the terminal event, including hidden stop tokens.
+            The generator retains ownership of physical cache entries.
+
+        :param checkpoint:
+            Save recurrent checkpoints for prefix reuse. False still reuses existing checkpoints.
+
         :param kwargs:
         """
+
+        if readout:
+            if token_healing:
+                raise ValueError("Token healing changes the input; disable it for feature readout")
+            max_new_tokens = 0
+        self.readout = readout
+        self.retain_decision_prefix = retain_decision_prefix
+        self.checkpoint_enabled = checkpoint
 
         assert all(ids.device.type == "cpu" for ids in input_ids), \
             "input_ids must reside in system memory"
@@ -211,7 +233,8 @@ class Job:
             "A job holds exactly one sequence (multi-sequence jobs are not supported)"
 
         # Generation parameters
-        assert max_new_tokens is None or max_new_tokens >= 1, "max_new_tokens must be >= 1, or None for no limit"
+        assert readout or max_new_tokens is None or max_new_tokens >= 1, \
+            "max_new_tokens must be >= 1, or None for no limit"
         # None: no limit beyond what the cache can hold; resolved against the generator in prepare_for_queue
         self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
@@ -762,6 +785,8 @@ class Job:
 
             if emit_eos:
                 self.is_finished = True
+                if self.retain_decision_prefix:
+                    r["sequence_ids"] = self.sequences[0].sequence_ids.torch().clone()
                 cached = self.rq_cached if self.rq_cached is not None else (
                     self.cached_pages // len(self.sequences),
                     (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
@@ -1079,6 +1104,8 @@ class Job:
             max_rq_tokens = self.orig_max_rq_tokens,
             stop_on_loop = self.stop_on_loop,
             rq_state = rq_state,
+            retain_decision_prefix = self.retain_decision_prefix,
+            checkpoint = self.checkpoint_enabled,
         )
 
         rq_job.prepare_for_queue(generator, serial_number, rq = True)
@@ -1108,7 +1135,9 @@ class Job:
                                       - 1 - self.generator.num_draft_tokens)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
-        if self.max_rq_tokens is not None:
+        if self.readout:
+            self.max_rq_tokens = 0
+        elif self.max_rq_tokens is not None:
             if len(self.sequences) == 1:
                 boundary = self.generator.recurrent_checkpoint_interval \
                     if self.generator.recurrent_cache is not None else PAGE_SIZE
@@ -1304,7 +1333,7 @@ class Job:
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
             recurrent_last_page = False
-            if self.generator.recurrent_cache is not None:
+            if self.generator.recurrent_cache is not None and self.checkpoint_enabled:
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
                 if prefill_start < last_page_b <= prefill_end:
@@ -1390,7 +1419,9 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
-                if self.generator.mtp_draft:
+                if self.readout and self.generator.mtp_draft:
+                    self.generator.model.forward_features(input_ids = prefill_ids, params = params)
+                elif self.generator.mtp_draft:
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
                     params["last_tokens_only"] = 1
@@ -1398,37 +1429,7 @@ class Job:
                 else:
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
-                if self.generator.dflash_draft:
-                    self.generator.draft_model.update_kv_from_target(
-                        target_hidden = params.get("export_states"),
-                        cache = self.generator.draft_cache,
-                        params = {
-                            "block_table": seq.block_index_tensor,
-                            "cache_seqlens": params["cache_seqlens"],
-                        }
-                    )
-                elif self.generator.draft_model:
-                    if self.generator.mtp_draft:
-                        target_hidden = params.get("export_states")[-1]
-                        carry_hidden = seq.mtp_carry_hidden
-                        if carry_hidden is None:
-                            carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
-                        shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
-                        seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
-                        self.mtp_last_hidden = seq.mtp_carry_hidden
-                    else:
-                        shifted_hidden = None
-                    self.generator.draft_model.prefill(
-                        input_ids = prefill_ids,
-                        params = {
-                            "target_hidden": shifted_hidden,
-                            "attn_mode": "flash_attn",
-                            "block_table": seq.block_index_tensor,
-                            "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                            "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
-                        }
-                    )
+                self._prefill_draft(seq, prefill_ids, params)
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the
@@ -1477,6 +1478,84 @@ class Job:
             if self.identifier is not None:
                 r.update({"identifier": self.identifier})
             results.append(r)
+
+
+    def _prefill_draft(self, seq, input_ids, params):
+        if self.generator.dflash_draft:
+            self.generator.draft_model.update_kv_from_target(
+                target_hidden = params.get("export_states"),
+                cache = self.generator.draft_cache,
+                params = {"block_table": seq.block_index_tensor,
+                          "cache_seqlens": params["cache_seqlens"]},
+            )
+        elif self.generator.draft_model:
+            if self.generator.mtp_draft:
+                target_hidden = params["export_states"][-1]
+                carry_hidden = seq.mtp_carry_hidden
+                if carry_hidden is None:
+                    carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
+                shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
+                seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
+                self.mtp_last_hidden = seq.mtp_carry_hidden
+            else:
+                shifted_hidden = None
+            self.generator.draft_model.prefill(
+                input_ids = input_ids,
+                params = {"target_hidden": shifted_hidden, "attn_mode": "flash_attn",
+                          "block_table": seq.block_index_tensor, "cache": self.generator.draft_cache,
+                          "cache_seqlens": params["cache_seqlens"],
+                          "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None},
+            )
+
+
+    def finish_readout(self):
+        """Commit the final input to both caches before publishing its page or checkpoint."""
+        seq = self.sequences[0]
+        start = seq.kv_position
+        ids = seq.sequence_ids.torch_slice(start, None)
+        params = {
+            "attn_mode": "flash_attn", "block_table": seq.block_index_tensor,
+            "cache": self.generator.cache,
+            "cache_seqlens": torch.tensor([start], dtype = torch.int32),
+            "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
+            "indexed_embeddings": self.embeddings, "inv_freq": self.alt_rope_freqs,
+        }
+        if self.generator.draft_model:
+            params.update(self.generator.draft_model.draft_verifier_params)
+        features = self.generator.model.forward_features(input_ids = ids, params = params)
+        self._prefill_draft(seq, ids, params)
+
+        page_index, offset = divmod(start, PAGE_SIZE)
+        page = seq.allocated_pages[page_index]
+        page.sequence[:, offset:offset + 1].copy_(ids)
+        page.kv_position = offset + 1
+        page.can_revert = False
+        seq.kv_position = start + 1
+        if page.kv_position == PAGE_SIZE:
+            previous = seq.allocated_pages[page_index - 1].phash if page_index else None
+            page.prev_hash = previous
+            phash = tensor_hash_checksum(page.sequence, previous)
+            shared = self.pagetable.referenced_pages.get(phash)
+            if shared is not None and shared is not page:
+                page.sub_ref()
+                shared.add_ref(page.access_serial)
+                seq.allocated_pages[page_index] = shared
+                seq.build_block_index_tensor()
+            else:
+                duplicate = self.pagetable.unreferenced_pages.get(phash)
+                if duplicate is not None:
+                    duplicate.clear()
+                page.update_hash(phash)
+            if self.generator.recurrent_cache is not None:
+                self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+        self.is_finished = True
+        return {
+            "job": self, "stage": "readout", "eos": True, "serial": self.serial_number,
+            "identifier": self.identifier, "features": features[0, -1].clone(),
+            "sequence_ids": seq.sequence_ids.torch().clone(),
+            "cached_tokens": self.cached_pages * PAGE_SIZE + self.cached_tokens,
+            "forwarded_tokens": len(seq.sequence_ids) - self.cached_pages * PAGE_SIZE - self.cached_tokens,
+        }
 
 
     def allocate_pages(self):
@@ -1600,6 +1679,8 @@ class Job:
         """
         Store the current recurrent state if the sequence is at a checkpoint boundary.
         """
+        if not self.checkpoint_enabled:
+            return
         seq = self.sequences[0]
 
         if seq.kv_position == 0:

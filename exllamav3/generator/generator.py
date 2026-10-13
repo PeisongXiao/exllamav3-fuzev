@@ -529,11 +529,22 @@ class Generator:
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill
+        job_left = False
         for job in list(self.active_jobs):
             try:
                 job.prefill(results)
+                if job.readout and job.is_prefill_done():
+                    result = job.finish_readout()
+                    job.deallocate_pages()
+                    self.active_jobs.remove(job)
+                    results.append(result)
+                    job_left = True
             except Exception as e:
                 self.reap_failed_job(job, e, results)
+                job_left = True
+
+        if job_left and not self.num_remaining_jobs():
+            self.on_queue_drained()
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:

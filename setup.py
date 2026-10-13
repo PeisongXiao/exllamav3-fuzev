@@ -1,7 +1,7 @@
 import importlib.util
 import os
 
-from setuptools import setup
+from setuptools import find_namespace_packages, setup
 
 if torch := importlib.util.find_spec("torch") is not None:
     from torch.utils import cpp_extension
@@ -81,5 +81,6 @@ setup_kwargs = (
 
 setup(
     verbose=verbose,
+    packages=find_namespace_packages(include=["exllamav3*"]),
     **setup_kwargs,
 )
