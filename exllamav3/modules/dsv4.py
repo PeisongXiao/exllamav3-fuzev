@@ -422,6 +422,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
 
@@ -583,6 +585,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
 
@@ -612,7 +616,7 @@ class DSV4Attention(Module):
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         stc = self.config.stc
-        self.sinks = stc.get_tensor(f"{self.key}.attn_sink", device, no_defer = True).float().contiguous()
+        self.sinks = stc.get_tensor(f"{self.key}.attn_sink", device, no_defer = True, arena = False).float().contiguous()
 
         self.inv_freq_main = yarn_inv_freq(self.rope_head_dim, self.rope_theta, device)
         self.inv_freq_compress = yarn_inv_freq(
@@ -626,11 +630,11 @@ class DSV4Attention(Module):
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
 
         if self.compressor is not None:
-            self.compressor.ape = stc.get_tensor(f"{self.compressor.key}.ape", device, no_defer = True).float().contiguous()
+            self.compressor.ape = stc.get_tensor(f"{self.compressor.key}.ape", device, no_defer = True, arena = False).float().contiguous()
             self.compressor.make_bc(self.inv_freq_compress)
         if self.indexer is not None:
             self.indexer.make_bc(self.inv_freq_compress)
-            self.indexer.ape = stc.get_tensor(f"{self.indexer.key}.ape", device, no_defer = True).float().contiguous()
+            self.indexer.ape = stc.get_tensor(f"{self.indexer.key}.ape", device, no_defer = True, arena = False).float().contiguous()
         for rl in self.recurrent_layers:
             rl.alloc(device)
         for cl in self.cache_layers:
@@ -657,6 +661,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
         self._bc_dsa_batch = {}
@@ -963,8 +969,6 @@ class DSV4Attention(Module):
         self._fan_scratch = {}
 
         from .multilinear import MultiLinear
-        self.qb_multi = self.wob_multi = None
-        self._one_idx = None
         try:
             if self.q_fan is None and self.q_b.quant_type == "exl3":
                 self.qb_multi = MultiLinear(self.device, [self.q_b])
@@ -1533,6 +1537,10 @@ class DSV4Attention(Module):
             q_idx = o2[1].view(1, rows, -1)
         elif self.qb_multi is not None and rows <= 32:
             q = self._mgemm1(self.qb_multi, q_res, torch.half, "dsv4_qb1_ah")
+            # qb_multi stands in when q_b and idx_wq_b can't share a fan, so the indexer query
+            # still needs its own projection
+            if need_q_idx:
+                q_idx = self.idx_wq_b.forward(q_res, params)
         else:
             q = self.q_b.forward(q_res, params)
             if need_q_idx:

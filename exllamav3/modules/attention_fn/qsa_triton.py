@@ -270,12 +270,19 @@ def qsa_sparse_attend_rows(
     qc: tuple | None = None,       # (k_scales, v_scales, k_bits, v_bits): k / v are the packed
                                    # int32 pages (CacheLayer_quant), dequantized online
     n_kv_heads: int | None = None, # required with qc (the packed rows carry no head axis)
+    *,
+    prefill_optimized: bool = False,
+    prefill_context: dict | None = None,
 ) -> torch.Tensor:
     """Eager gathered GQA attention, one index list per query row: the sparse prefill /
     eager-fallback form of the BC sparse decode kernels. block_table = None runs the flat
     (non-paged) variant over contiguous K/V (the nc path); with a block table, indices are
     cache positions mapped through it (the cached path). Splits size to the grid, so few
     rows (decode fallback) still fill the device. Returns (R, n_q_heads, head_dim) fp16."""
+    if prefill_optimized:
+        from .qsa_prefill import attend
+        return attend(q, k, v, indices, sm_scale, block_table, page_size, qc, n_kv_heads,
+                      context=prefill_context)
     from .triton_paged import _paged_attn_decode_combine_kernel
     R, H, hd = q.shape
     if qc is not None:
@@ -324,7 +331,7 @@ def qsa_sparse_attend_rows(
         _paged_attn_decode_combine_kernel[(programs, (BLOCK_H // rows_sub) * (hd // d_sub))](
             partial_o, partial_ml, o, h32, splits, partial_ml,
             QCV = v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
-            head_dim = hd, HD_PAD = hd, V_DIM = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
+            head_dim = hd, HD_PAD = hd, V_DIM = hd, BLOCK_ROWS = BLOCK_H,
             ROWS_SUB = rows_sub, D_SUB = d_sub,
             num_warps = 4, num_stages = 1,
         )

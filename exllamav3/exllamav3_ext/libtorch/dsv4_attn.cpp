@@ -604,7 +604,7 @@ at::Tensor BC_DSV4BatchAttention::run(const at::Tensor& x, int B, int S)
     Slot& s = slot(B, S);
     TORCH_CHECK(s.configured, "BC_DSV4BatchAttention: slot not configured");
 
-    if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+    if (s.graph->is_disabled() || (!s.graph->ready && !s.graph->ready_to_record))
     {
         run_gr(x, B, S, s, nullptr);
         s.graph->ready_to_record = true;
@@ -613,9 +613,13 @@ at::Tensor BC_DSV4BatchAttention::run(const at::Tensor& x, int B, int S)
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(x, B, S, s, s.graph.get());
-        s.graph->capture_end();
+        if (!capture.finish())
+        {
+            run_gr(x, B, S, s, nullptr);
+            return s.y_st;
+        }
     }
 
     // Everything is device-driven; the input pointer is the only patched parameter
@@ -634,7 +638,7 @@ at::Tensor BC_DSV4Attention::run(const at::Tensor& x, int pos, int win_beg, int 
     Slot& s = slot(seq, regime);
     TORCH_CHECK(s.configured, "BC_DSV4Attention: slot not configured");
 
-    if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+    if (s.graph->is_disabled() || (!s.graph->ready && !s.graph->ready_to_record))
     {
         run_gr(x, seq, regime, pos, win_beg, s, nullptr);
         s.graph->ready_to_record = true;
@@ -643,9 +647,13 @@ at::Tensor BC_DSV4Attention::run(const at::Tensor& x, int pos, int win_beg, int 
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(x, seq, regime, pos, win_beg, s, s.graph.get());
-        s.graph->capture_end();
+        if (!capture.finish())
+        {
+            run_gr(x, seq, regime, pos, win_beg, s, nullptr);
+            return s.y_st;
+        }
     }
 
     int ec = comp_bc ? (pos + seq) / m : 0;

@@ -6,9 +6,10 @@ from ..cache import Cache
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle
-from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP
+from ..modules import RMSNorm, TransformerBlock, Attention, SlidingAttention, SWAState, GatedMLP
 from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.device_copy import to_device
 import weakref
 
@@ -158,6 +159,15 @@ def dflash_update_kv_from_target(
     bsz, target_seqlen, dim = target_hidden.shape
     params["target_hidden_cc"] = target_hidden
 
+    # Sliding-window layers kept as recurrent states (SlidingAttention, swa_full off) take their
+    # rows into the window rings at the batch rows' positions; the rest go to the paged cache
+    rsg = params.get("recurrent_states")
+    ring_plan = None
+    if rsg is not None:
+        swa_layer = next((l for l in model.attn_modules if isinstance(l, SlidingAttention)), None)
+        if swa_layer is not None:
+            ring_plan = swa_layer.plan_state_rows(rsg, params["cache_seqlens"].tolist(), lengths, target_seqlen)
+
     # Update KV layers
     for layer in model.attn_modules:
         block_table = get_for_device(params, "block_table", layer.device)
@@ -184,9 +194,17 @@ def dflash_update_kv_from_target(
             None,
         )
 
+        if isinstance(layer, SlidingAttention):
+            assert ring_plan is not None, "DFlash draft with sliding-window states needs the draft's recurrent states"
+            layer.write_state_rows(rsg, ring_plan, k, v)
+            continue
+
         # Write k, v rows to the paged cache; quantized caches quantize them in place rather
         # than dequantizing/requantizing full layers
         cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+
+    if ring_plan is not None:
+        SlidingAttention.commit_state_rows(rsg, ring_plan)
 
 
 class DFlashModel(Model):
@@ -199,9 +217,11 @@ class DFlashModel(Model):
     def __init__(
         self,
         config: DFlashConfig,
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
         self.input_layer = DFlashInputLayer(
             config = config,
@@ -223,7 +243,11 @@ class DFlashModel(Model):
         for idx in range(config.num_hidden_layers):
             window_left, window_right = config.block_window(idx)
 
-            attn = Attention(
+            # Sliding-window layers keep a window ring per sequence (a recurrent state, stashed with
+            # the target's checkpoints) instead of a context-sized paged cache; -swa_full keeps the
+            # paged cache
+            swa = config.layer_types[idx] == "sliding_attention" and not swa_full
+            attn = (SlidingAttention if swa else Attention)(
                 config = config,
                 key = f"layers.{idx}.self_attn",
                 layer_idx = idx,
@@ -306,6 +330,13 @@ class DFlashModel(Model):
             "default_draft_size": config.block_size - 1,
             "autosplit_load_fwd": False,
         })
+        self.recurrent_state_cls = None
+        if any(isinstance(m, SlidingAttention) for m in self.attn_modules):
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 2048,
+            })
+            self.recurrent_state_cls = SWAState
 
         self.attached_model = None
 
@@ -334,24 +365,8 @@ class DFlashModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        if not self.attached_model().loaded_tp:
-            ll = self.attached_model().logit_layer_idx
-            lm = self.attached_model().modules[ll]
-            logits = lm.prepare_for_device(state, params)
-            logits = lm.forward(logits, params)
-            logits = logits[..., :self.attached_model().config.vocab_size]
-            if params.get("export_draft_conf"):
-                # Per-position confidence for the generator's draft truncation: the argmax logit
-                # value separates converged from degenerate block positions far better than any
-                # distribution-shape statistic (the softcapped head is near-flat either way)
-                conf, ids = torch.max(logits, dim = -1)
-                params["draft_conf"] = conf
-                return ids
-            return torch.argmax(logits, dim = -1)
-        else:
-            state = self.attached_model().tp_producer.send(state)
-            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
-            return argmax
+        # The target's head, TP-aware; exports draft confidence when the generator asks
+        return self.attached_model().lm_head_argmax(state, params)
 
 
     def default_load_shape_dtype(self, chunk_size):
@@ -368,6 +383,8 @@ class DFlashModel(Model):
         # flag is only needed when every layer is causal; windowed layers carry their own bounds
         params["causal"] = self.config.is_causal is True
         input_ids = prepare_for_attn(input_ids, params)
+        if self.recurrent_state_cls is not None:
+            prepare_for_recurrence(input_ids, params, self)
         return input_ids
 
 

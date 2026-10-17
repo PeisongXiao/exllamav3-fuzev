@@ -1,5 +1,6 @@
 from __future__ import annotations
 from functools import cached_property
+import operator
 from typing_extensions import override
 import torch
 import numpy as np
@@ -7,8 +8,10 @@ from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
+from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult, had_n
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+from ..util.pinned_arena import PinnedArena
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -212,7 +215,7 @@ class Linear(Module):
                 if scale_q is not None and scale_q.dim() == 2:
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
-                    w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True)
+                    w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
                     weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
                     if self.transposed_load:
                         weight = weight.T
@@ -223,9 +226,12 @@ class Linear(Module):
                     scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     assert scale is None or scale_inv is None
-                    no_defer = scale is not None or scale_inv is not None or self.weight_scale != 1.0
-                    weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
-                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
+                    # Scaled loads are rewritten into a new tensor below: keep the raw load out of
+                    # the loader's slab blocks, where the dead copy would otherwise stay resident
+                    rescaled = scale is not None or scale_inv is not None or self.weight_scale != 1.0
+                    no_defer = rescaled
+                    weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer, arena = not rescaled)
+                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer, arena = not rescaled)
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
                 elif scale_inv is not None:
@@ -428,8 +434,8 @@ class Linear(Module):
         sv = opt(".sv", self.device, no_defer = True)
         svh = opt(".svh", self.device)
         trellis = stc.get_tensor(key + ".trellis", self.device)
-        mcg = opt(".mcg", "cpu")
-        mul1 = opt(".mul1", "cpu")
+        mcg = stc.get_codebook_marker(key + ".mcg", codebook_mcg_mult)
+        mul1 = stc.get_codebook_marker(key + ".mul1", codebook_mul1_mult)
         bias = opt(".bias", self.device)
         self.inner = LinearEXL3(
             self.config,
@@ -483,9 +489,13 @@ class Linear(Module):
             return
 
         def pin_alias(t):
+            # An arena of the tensor's own size rather than a tensor from torch's pinned allocator, which
+            # rounds each request up to a power of two and keeps the block after the tower is unloaded
             if not t.is_contiguous():
                 t = t.contiguous()
-            p = torch.empty(t.shape, dtype = t.dtype, device = "cpu", pin_memory = True)
+            nbytes = t.numel() * t.element_size()
+            inner._pinned_arena = PinnedArena(nbytes, f"Pinned weights of {self.key}", mapped = True, required = True)
+            p = inner._pinned_arena.tensor[:nbytes].view(t.dtype).view(t.shape)
             p.copy_(t)
             return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
 
@@ -612,6 +622,51 @@ class Linear(Module):
     @override
     def weights_numel(self):
         return self.in_features * self.out_features
+
+
+    @torch.inference_mode()
+    def select_outputs(self, token_ids: list[int] | tuple[int, ...]):
+        """Build a compact EXL3 projection and ordered gather index, or return None for native fallback.
+
+        Call once on the model owner for a loaded, immutable, unsliced layer. The result shares input
+        factors/codebook markers with this layer and owns its selected output blocks. Rebuild it when
+        the model changes; callers with active adapters use the original forward instead.
+        """
+        token_ids = [operator.index(i) for i in token_ids]
+        if not token_ids or any(not 0 <= i < self.out_features_unpadded for i in token_ids):
+            raise ValueError("Expected nonempty CPU token IDs within the unpadded output range")
+        inner = self.inner
+        if (type(self) is not Linear or type(inner) is not LinearEXL3 or self.is_sliced
+                or self.lora_a_tensors or self.lora_b_tensors or inner.swap_device is not None
+                or getattr(inner, "_pinned_store", None) is not None or not inner.trellis.is_cuda
+                or inner.in_features != self.in_features or inner.out_features != self.out_features
+                or self.in_features % had_n or self.out_features % had_n):
+            return None
+
+        # Keep complete output Hadamard blocks, using the native TP output-slice layout.
+        starts = sorted({i // had_n * had_n for i in token_ids})
+        slots = {start: slot for slot, start in enumerate(starts)}
+        width = len(starts) * had_n
+        selected = Linear(
+            self.config, self.key, self.in_features, width, pad_to = 1,
+            out_dtype = self.out_dtype, pre_scale = self.pre_scale, softcap = self.softcap,
+            post_scale = self.post_scale, allow_input_padding = self.allow_input_padding,
+        )
+        selected.in_features_unpadded = self.in_features_unpadded
+        selected.device = inner.trellis.device
+        selected.inner = LinearEXL3(
+            inner.config, self.in_features, width, suh = inner.suh,
+            svh = torch.cat([inner.svh[start:start + had_n] for start in starts]),
+            trellis = torch.cat([inner.trellis[:, start // 16:(start + had_n) // 16]
+                                 for start in starts], dim = 1),
+            mcg = inner.mcg_tensor, mul1 = inner.mul1_tensor,
+            bias = torch.cat([inner.bias[start:start + had_n] for start in starts]) if inner.bias is not None else None,
+            out_dtype = inner.out_dtype, transformers_fix = inner.transformers_fix, key = inner.key,
+        )
+        selected.quant_type = selected.inner.quant_type
+        gather = torch.tensor([slots[i // had_n * had_n] * had_n + i % had_n for i in token_ids],
+                              dtype = torch.long, device = selected.device)
+        return selected, gather
 
 
     @override

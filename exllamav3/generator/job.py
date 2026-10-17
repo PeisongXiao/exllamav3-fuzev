@@ -1,5 +1,7 @@
 from __future__ import annotations
 import torch
+import logging
+import operator
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .generator import Generator
@@ -14,6 +16,7 @@ from .loop_detect import LoopDetector
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
+from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from functools import lru_cache
 from ..util import profile_opt
 
@@ -42,6 +45,86 @@ def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | No
     return concat_strings, offsets
 
 
+class ReadoutRoot:
+    """Request-owned exact prefix; children lease its pages and paired checkpoint."""
+
+    def __init__(self, job, snapshot):
+        self.generator = job.generator
+        self.owner_serial = self.generator.cache_owner_serial
+        seq = job.sequences[0]
+        self.ids = seq.sequence_ids.torch().clone()
+        self.position = len(seq.sequence_ids)
+        self.pages = tuple(seq.allocated_pages)
+        self.page_hashes = tuple(page.phash for page in self.pages[:self.position // PAGE_SIZE])
+        self.embeddings = tuple(job.embeddings)
+        self.alt_rope_offset = job.alt_rope_offset
+        self.max_tail_tokens = job.readout_root_tokens
+        self.suffix_pages = job.readout_reserved_pages
+        self.snapshot = snapshot
+        self.mtp_carry = seq.mtp_carry_hidden.clone() if seq.mtp_carry_hidden is not None else None
+        self.children = set()
+        self.active_pages = 0
+        self.closed = False
+        self.fallback_logged = False
+        acquired = []
+        try:
+            for page in self.pages:
+                page.add_ref(job.serial_number)
+                acquired.append(page)
+            self.generator.readout_roots.add(self)
+        except Exception:
+            self.generator.pagetable.deallocate_pages(acquired)
+            raise
+
+    @property
+    def reserved_pages(self):
+        return max(0, self.suffix_pages - self.active_pages)
+
+    def validate(self, job, generator):
+        if (self.closed or self not in generator.readout_roots or generator is not self.generator
+                or generator.cache.owner_serial != self.owner_serial):
+            raise ValueError("Readout root is closed or belongs to another cache owner")
+        ids = job.sequences[0].sequence_ids.torch()
+        tail_len = ids.shape[-1] - self.position
+        if not 0 < tail_len <= self.max_tail_tokens or not torch.equal(ids[:, :self.position], self.ids):
+            raise ValueError("Readout child must extend the exact root within its declared tail bound")
+        return bool((ids[:, self.position:] >= FIRST_MM_EMBEDDING_INDEX).any())
+
+    def close(self):
+        if dispatch := getattr(self.generator, "_async_owner", None):
+            return dispatch(self._close)
+        self._close()
+
+    def _close(self):
+        self.closed = True
+        if self.children or self not in self.generator.readout_roots:
+            return
+        self.generator.readout_roots.remove(self)
+        self.generator.pagetable.deallocate_pages(self.pages)
+        if self.snapshot is not None:
+            self.generator.recurrent_cache.unpin(self.snapshot)
+            self.snapshot = None
+        self.mtp_carry = None
+        self.pages = ()
+        if self.generator.cache.owner_serial == self.owner_serial and not self.generator.num_remaining_jobs():
+            self.generator.on_queue_drained()
+
+    def invalidate(self):
+        # A replacement generator owns the state slots; release only this owner's metadata/snapshot.
+        for job in self.children:
+            job.recurrent_state = None
+            job.readout_root = None
+            job.readout_private_pages = 0
+        self.children.clear()
+        self.active_pages = 0
+        self.close()
+
+    def detach(self, job):
+        self.children.discard(job)
+        if self.closed:
+            self.close()
+
+
 class Job:
 
     def __init__(
@@ -68,6 +151,8 @@ class Job:
         readout: bool = False,
         retain_decision_prefix: bool = False,
         checkpoint: bool = True,
+        readout_root_tokens: int | None = None,
+        readout_root: ReadoutRoot | None = None,
         **kwargs
     ):
         """
@@ -154,16 +239,38 @@ class Job:
         :param checkpoint:
             Save recurrent checkpoints for prefix reuse. False still reuses existing checkpoints.
 
+        :param readout_root_tokens:
+            For readout only, retain an exact root with room for a child tail of at most this many tokens.
+            The terminal event supplies readout_root, or None and readout_fallback if capacity is insufficient.
+
+        :param readout_root:
+            For readout only, consume a bounded text tail from this live root on the same generator.
+
         :param kwargs:
         """
 
+        if readout_root_tokens is not None:
+            readout_root_tokens = operator.index(readout_root_tokens)
+            if readout_root_tokens <= 0:
+                raise ValueError("readout_root_tokens must be a positive integer")
+        if (readout_root_tokens is not None or readout_root is not None) and not readout:
+            raise ValueError("Readout roots require readout=True")
+        if readout_root_tokens is not None and readout_root is not None:
+            raise ValueError("A readout child cannot also retain a root")
         if readout:
             if token_healing:
                 raise ValueError("Token healing changes the input; disable it for feature readout")
             max_new_tokens = 0
         self.readout = readout
+        self.readout_root_tokens = readout_root_tokens
+        self.readout_root = readout_root
+        self.readout_serial = False
+        self.readout_reserved_pages = 0
+        self.readout_reservation_active = False
+        self.readout_private_pages = 0
+        self.readout_fallback = None
         self.retain_decision_prefix = retain_decision_prefix
-        self.checkpoint_enabled = checkpoint
+        self.checkpoint_enabled = checkpoint and readout_root is None
 
         assert all(ids.device.type == "cpu" for ids in input_ids), \
             "input_ids must reside in system memory"
@@ -276,17 +383,11 @@ class Job:
         self.stop_string_max_length = max([0] + [len(x) for x in self.stop_strings_list])
 
         # Banned strings
-        if banned_strings:
-            self.banned_strings = [s.lower() for s in banned_strings]
-            self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
-                _strings_to_utf32(tuple(self.banned_strings))
-        else:
-            self.banned_strings = []
-            self.banned_strings_utf32_buffer = None
-            self.banned_strings_utf32_offsets = None
+        self._init_banned_strings(banned_strings)
 
         self.checkpoint = None
         self.checkpoint_rewound = False
+        self.replay_needs_allocation = False
 
         # Metrics
         self.time_enqueue = None
@@ -317,7 +418,7 @@ class Job:
         self.logits_device = None
 
         # Embeddings
-        self.embeddings = embeddings or []
+        self.embeddings = list(readout_root.embeddings) if embeddings is None and readout_root is not None else embeddings or []
         self.alt_rope_freqs = None
         self.alt_rope_offset = 0
 
@@ -342,9 +443,11 @@ class Job:
 
         # N-gram automaton
         self.sam = rq_state.get("sam", None)
+        self.sam_match = None
 
         # MTP state
         self.mtp_last_hidden = None
+        self.rq_mtp_hidden = rq_state.get("mtp_last_hidden")
 
 
     def get_pinned_logit_mask(self):
@@ -388,6 +491,8 @@ class Job:
 
 
     def is_prefill_done(self):
+        if self.readout_root is not None and not self.readout_serial:
+            return all(seq.kv_position == len(seq.sequence_ids) for seq in self.sequences)
         return all(seq.kv_position == len(seq.sequence_ids) - 1 for seq in self.sequences)
 
 
@@ -555,13 +660,182 @@ class Job:
 
         # Accept any text held back by a partial banned-string match. Matching is suspended while
         # forced tokens remain, so the checkpoint could never be rewound to anyway
-        self.checkpoint = None
+        self._release_banned_hold()
 
         if self.forced_ids is not None:
             ids = torch.cat((self.forced_ids[:, self.forced_index:], ids), dim = -1)
         self.forced_ids = ids
         self.forced_index = 0
         self.forced_ids_device = None
+
+
+    def set_sampler(self, sampler: Sampler | None):
+        """
+        Replace the job's sampler mid-generation, e.g. to sample a response block differently from the
+        reasoning block before it. Takes effect from the next token the generator samples for this job.
+
+        Call between iterations: from the thread driving Generator.iterate(), or from any coroutine on the
+        event loop for an AsyncJob. Tokens sampled before the call keep their original settings, which
+        includes any already sampled but not yet seen by the caller: text held back by a stop string,
+        banned string or incomplete character, the rest of a speculative window accepted in the same
+        iteration, and (AsyncJob) results still queued for the consumer.
+
+        :param sampler:
+            New sampler, or None for the default sampler.
+        """
+        self.sampler = sampler if sampler is not None else DefaultSampler()
+
+
+    def set_filters(self, filters: list[Filter] | None):
+        """
+        Replace the job's filters mid-generation, e.g. to constrain only the response that follows a
+        free-form reasoning block. The new filters start from their initial state at the next token the
+        generator samples for this job (or wait for their trigger token from that point), and see none
+        of the output before it. Timing and caveats are as for set_sampler().
+
+        Any text currently held by a partial banned-string match is released (emitted with the next
+        output), since a later rewind could not be replayed through filters that were not there when the
+        held tokens were sampled. Banned-string matching itself continues for new text.
+
+        Filters disabled by constrain_output_now() stay disabled while injected tokens are still pending;
+        replacing them is only possible once the injection has drained.
+
+        :param filters:
+            New list of filters, or None/[] to remove all filters.
+        """
+        if self.forced_ids is not None:
+            raise ValueError("Cannot replace filters while a constrain_output_now() injection is still pending")
+        filters = list(filters) if filters else []
+        self._release_banned_hold()
+        self.filters = filters
+        self.filters_suspended = False
+        # Once the job has a generator, attach and reset here: activate() resets filters only for a job's
+        # first round, so a requeued job would otherwise keep the new filters unattached
+        if self.generator is not None:
+            for f in self.filters:
+                f.attach(self)
+                f.reset()
+                f.is_active = f.trigger_token is None
+
+
+    def set_banned_strings(self, banned_strings: list[str] | None):
+        """
+        Replace the job's banned strings mid-generation. Takes effect for text sampled after the call;
+        timing and caveats are as for set_sampler().
+
+        Text currently held back by a partial match against the old banned strings is released: it can no
+        longer be rewound, and it goes out with the next output unless something else holds it. Text held for
+        other reasons stays held: an incomplete UTF-8 character until it completes, the start of a possible
+        stop string until it resolves, and a partial match against the new banned strings that starts in the
+        released text and continues into new tokens (a full match there rewinds only the new tokens).
+
+        :param banned_strings:
+            New list of banned strings (case-insensitive), or None/[] to disable banned strings.
+        """
+        if self.generator is not None:
+            self._check_banned_strings([s.lower() for s in banned_strings or []])
+        self._release_banned_hold()
+        self._init_banned_strings(banned_strings)
+
+
+    def _init_banned_strings(self, banned_strings: list[str] | None):
+        if banned_strings:
+            self.banned_strings = [s.lower() for s in banned_strings]
+            self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
+                _strings_to_utf32(tuple(self.banned_strings))
+        else:
+            self.banned_strings = []
+            self.banned_strings_utf32_buffer = None
+            self.banned_strings_utf32_offsets = None
+
+
+    def _check_banned_strings(self, banned_strings: list[str]):
+        if banned_strings and self.generator.recurrent_cache is not None:
+            # SWA states rewind in place, but only within their guaranteed rollback window (one page). Since the
+            # matched text is tokenized by the model and its boundaries are ambiguous, require a margin below that
+            # limit for the reference tokenization of each banned string. States without in-place rollback rewind
+            # by restoring a past checkpoint and replaying, which has no length limit.
+            guaranteed = getattr(self.generator.cache.recurrent_state_cls, "guaranteed_rollback", 0)
+            if guaranteed:
+                max_ref_tokens = guaranteed - 8
+                for s in banned_strings:
+                    ref_tokens = self.generator.tokenizer.encode(s).shape[-1]
+                    assert ref_tokens <= max_ref_tokens, \
+                        f"Banned string tokenizes to {ref_tokens} tokens, exceeding the maximum of " \
+                        f"{max_ref_tokens} supported by this model's recurrent state rollback: {s!r}"
+
+
+    def _release_banned_hold(self):
+        """
+        Drop the banned-string checkpoint, accepting the tokens held since it was set: they can no longer be
+        rewound, the held text goes out with the next emitted output, and pages completed during the hold
+        are hashed.
+        """
+        self.hash_deferred_pages()
+        self.checkpoint = None
+
+
+    def hash_completed_page(self, seq: Sequence, page_idx: int):
+        """
+        Give a page its content hash once all of its tokens are final, and link the following page to it.
+        """
+        page = seq.allocated_pages[page_idx]
+        old_hash = page.phash
+
+        if page_idx > 0:
+            last_page = seq.allocated_pages[page_idx - 1]
+            last_hash = last_page.phash
+        else:
+            last_hash = None
+
+        page_ids = seq.sequence_ids.torch_slice(page_idx * PAGE_SIZE, (page_idx + 1) * PAGE_SIZE)
+        new_hash = tensor_hash_checksum(page_ids, last_hash)
+        if new_hash == old_hash:
+            return
+
+        # A deferred page may already anchor a recurrent checkpoint, stashed under the hash it had when
+        # the position crossed the boundary. Move it along so it stays findable under the final hash
+        rc = self.generator.recurrent_cache
+        if rc is not None and old_hash in rc and new_hash not in rc:
+            rc[new_hash] = rc.pop(old_hash)
+
+        # If another referenced page has the same hash, switch to referencing that instead
+        if new_hash in self.pagetable.referenced_pages:
+            new_serial = page.access_serial
+            page.sub_ref()
+            page = self.pagetable.referenced_pages[new_hash]
+            assert page.kv_position == PAGE_SIZE
+            seq.allocated_pages[page_idx] = page
+            seq.build_block_index_tensor()
+            page.add_ref(new_serial)
+
+        else:
+            # If an unreferenced page has the same hash, clear that page
+            if new_hash in self.pagetable.unreferenced_pages:
+                up = self.pagetable.unreferenced_pages[new_hash]
+                up.clear()
+
+            # Update the hash
+            page.update_hash(new_hash)
+
+        # Allow completing the final page without starting a new one (for requeue)
+        if page_idx + 1 < len(seq.allocated_pages):
+            page = seq.allocated_pages[page_idx + 1]
+            page.prev_hash = new_hash
+            page.can_revert = False
+
+
+    def hash_deferred_pages(self):
+        """
+        Hash the pages that completed while a banned-string checkpoint was holding tokens. Called when the
+        held tokens become final: the hold is released, or the job ends or requeues with the checkpoint in
+        place. A rewind discards the deferred pages instead, since it truncates them.
+        """
+        if self.checkpoint is None:
+            return
+        for seq, page_idx in self.checkpoint["deferred_pages"]:
+            self.hash_completed_page(seq, page_idx)
+        self.checkpoint["deferred_pages"].clear()
 
 
     def _pop_forced_token(self, device) -> torch.Tensor:
@@ -653,7 +927,7 @@ class Job:
 
         # Accept token
         self.new_tokens += 1
-        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.num_draft_tokens
+        requeue_now = self.new_tokens > self.max_rq_tokens - self.rq_margin
 
         for seq in self.sequences:
 
@@ -661,50 +935,21 @@ class Job:
             seq.sequence_ids.append(next_token)
             page_before = seq.kv_position // PAGE_SIZE
             seq.kv_position += 1
-            pos = seq.kv_position
-            if self.checkpoint:
-                pos -= self.checkpoint["offset"]
-            page_after = pos // PAGE_SIZE
+            page_after = seq.kv_position // PAGE_SIZE
 
             # Hash completed page
             if page_after > page_before:
-                assert page_after == page_before + 1
 
-                page = seq.allocated_pages[page_before]
-
-                if page_before > 0:
-                    last_page = seq.allocated_pages[page_before - 1]
-                    last_hash = last_page.phash
+                # A page that completes while a banned-string checkpoint holds tokens contains tokens that
+                # may still be rewound, so it can't be published under its content hash yet. Defer it until
+                # the hold resolves. The next page starts filling right away: link it to the completed
+                # page's current (unique) hash in the meantime, so it never reads as the root of a sequence
+                if self.checkpoint and self.checkpoint["offset"] > 0:
+                    self.checkpoint["deferred_pages"].append((seq, page_before))
+                    if page_after < len(seq.allocated_pages):
+                        seq.allocated_pages[page_after].prev_hash = seq.allocated_pages[page_before].phash
                 else:
-                    last_hash = None
-
-                page_ids = seq.sequence_ids.torch_slice(page_before * PAGE_SIZE, page_after * PAGE_SIZE)
-                new_hash = tensor_hash_checksum(page_ids, last_hash)
-
-                # If another referenced page has the same hash, switch to referencing that instead
-                if new_hash in self.pagetable.referenced_pages:
-                    new_serial = page.access_serial
-                    page.sub_ref()
-                    page = self.pagetable.referenced_pages[new_hash]
-                    assert page.kv_position == PAGE_SIZE
-                    seq.allocated_pages[page_before] = page
-                    seq.build_block_index_tensor()
-                    page.add_ref(new_serial)
-
-                else:
-                    # If an unreferenced page has the same hash, clear that page
-                    if new_hash in self.pagetable.unreferenced_pages:
-                        up = self.pagetable.unreferenced_pages[new_hash]
-                        up.clear()
-
-                    # Update the hash
-                    page.update_hash(new_hash)
-
-                # Allow completing the final page without starting a new one (for requeue)
-                if page_after < len(seq.allocated_pages):
-                    page = seq.allocated_pages[page_after]
-                    page.prev_hash = new_hash
-                    page.can_revert = False
+                    self.hash_completed_page(seq, page_before)
 
         # Stream output
 
@@ -754,6 +999,14 @@ class Job:
                     emit_held = True
 
             if emit_held:
+                if emit_eos and "�" in self.held_text and self.held_tokens:
+                    # The job ends with pieces still held (max_new_tokens, a filter, a stop string): characters
+                    # split across those pieces are repaired by decoding them together; a character the last
+                    # token left incomplete stays as it is, nothing more is coming
+                    self.held_text = self.generator.tokenizer.decode(
+                        self.held_tokens.torch(),
+                        decode_special_tokens = self.decode_special_tokens
+                    )[0]
                 if self.held_text != "":
                     self.full_completion += self.held_text
                     r.update({ "text": self.held_text })
@@ -778,6 +1031,8 @@ class Job:
                 r.update({ "suppressed_tokens": suppressed_tokens.torch() })
 
             if emit_eos or requeue_now:
+                # Nothing can be rewound past this point, so pages deferred by a held checkpoint are final
+                self.hash_deferred_pages()
                 self.time_last_token = time.time()
                 self.time_enqueued += self.time_first_prefill - self.time_enqueue
                 self.time_prefill += self.time_first_token - self.time_first_prefill
@@ -801,7 +1056,7 @@ class Job:
                     "cached_pages": cached[0],
                     "cached_tokens": cached[1],
                 })
-                if self.generator.draft_model or self.generator.ngram_match_min:
+                if self.generator.draft_model or self.generator.ngram_match_min or self.generator.hybrid_draft_tokens:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
                         "rejected_draft_tokens": self.rejected_draft_tokens
@@ -863,8 +1118,8 @@ class Job:
         if filter_eos_condition:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
-        # Hold text if it ends in an incomplete character
-        if self.held_text.endswith("�"):
+        # Hold text while it contains an incomplete character
+        if "�" in self.held_text:
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
@@ -879,6 +1134,7 @@ class Job:
 
         # Hold text as long as it contains part of a banned string
         def unset_checkpoint():
+            self.hash_deferred_pages()
             self.checkpoint = None
 
         def set_checkpoint():
@@ -892,6 +1148,7 @@ class Job:
                     "held_k_probs": self.held_k_probs.clone(1),
                     "held_logits": self.held_logits.clone(1),
                     "explored_tokens": [next_token.item()],
+                    "deferred_pages": [],
                 }
                 # Keep the nearest recurrent stash warm in the LRU cache in case this hold ends in a rewind
                 if self.recurrent_state is not None:
@@ -910,6 +1167,8 @@ class Job:
             # fed to the filters when it was sampled)
             for f in self.filters:
                 f.rewind(offset)
+            # The suffix automaton re-accepts from the truncated sequence on its next query
+            self.sam_match = None
 
             # The attention cache rewinds by truncation, but recurrent states advance destructively. SWA states
             # can roll back in place within their stored window; other states are restored from the most recent
@@ -919,20 +1178,20 @@ class Job:
             replay_from = None
             if self.recurrent_state is not None:
                 target = self.sequences[0].kv_position - offset
-                # During draft verification the state runs ahead of the accepted K/V position, so rewind by the
-                # state's actual distance from the target rather than by the checkpoint offset
-                rw = self.recurrent_state.position - target
-                if rw <= self.recurrent_state.rollback_capacity():
-                    self.recurrent_state.rewind(rw)
+                # During draft verification the state runs ahead of the accepted K/V position, so rewind to the
+                # target position rather than by the checkpoint offset; every side of the pair must be able to
+                # roll back in place, else the pair is restored from a stash
+                if self.recurrent_state.can_rewind_to(target):
+                    self.recurrent_state.rewind_to(target)
                 else:
                     stashed = self.find_recurrent_stash(target)
                     self.recurrent_state.free()
                     if stashed is not None:
                         replay_from = stashed["position"]
-                        self.recurrent_state = self.generator.cache.new_from_stashed(stashed, replay_from)
+                        self.recurrent_state = self.generator.recurrent_state_from_stashed(stashed, replay_from)
                     else:
                         replay_from = 0
-                        self.recurrent_state = self.generator.cache.get_new_state()
+                        self.recurrent_state = self.generator.new_recurrent_state()
                     self.last_recurrent_checkpoint_pos = replay_from or None
 
             for seq in self.sequences:
@@ -947,6 +1206,9 @@ class Job:
                     # verification window; roll those back too, stopping at the write frontier
                     if pi > p_page and page.kv_position == 0:
                         break
+                    if page.ref_count > 1:
+                        self.replay_needs_allocation = True
+                        continue
                     page.can_revert = False
                     if page.kv_position == PAGE_SIZE:
                         page.update_hash(random_hash())
@@ -956,25 +1218,36 @@ class Job:
                         page.kv_position = 0
                 # Pages between the replay position and the rewind target keep their metadata: their contents are
                 # re-processed by prefill (which ignores page completeness while the state position trails the K/V
-                # position) and rewritten with identical values, and they may include shared prompt-cache pages
+                # position) and rewritten with identical values. If any of them is shared, the generator requeues
+                # the job so it replays into private pages
                 if replay_from is not None:
                     seq.kv_position = replay_from
                     seq.prefill_complete = False
+                    self.replay_needs_allocation |= any(
+                        page.ref_count > 1 for page in seq.allocated_pages[replay_from // PAGE_SIZE:n_page + 1])
 
             # An MTP draft carry refers to the pre-rewind context; drop it so drafting pauses until the next
             # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
             # draft verification window must be abandoned.
             self.mtp_last_hidden = None
             self.checkpoint_rewound = True
+            # Every deferred page held rewound tokens and was truncated above
+            self.checkpoint["deferred_pages"].clear()
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
             off_text = self.held_text[len(self.checkpoint["held_text"]):]
             self.held_text = self.checkpoint["held_text"]
-            self.held_tokens = self.checkpoint["held_tokens"]
-            self.held_probs = self.checkpoint["held_probs"]
-            self.held_k_tokens = self.checkpoint["held_k_tokens"]
-            self.held_k_probs = self.checkpoint["held_k_probs"]
-            self.held_logits = self.checkpoint["held_logits"]
+            self.held_tokens = self.checkpoint["held_tokens"].clone()
+            self.held_probs = self.checkpoint["held_probs"].clone()
+            self.held_k_tokens = self.checkpoint["held_k_tokens"].clone()
+            self.held_k_probs = self.checkpoint["held_k_probs"].clone()
+            self.held_logits = self.checkpoint["held_logits"].clone()
+            # The checkpoint stays in place (offset 0, explored tokens) in case the resampled token is
+            # rejected too. The caller emits the restored buffers right away, so what a second rewind
+            # must restore is the empty state after that emit, not the pre-match contents again
             self.checkpoint["offset"] = 0
+            self.checkpoint["held_text"] = ""
+            for k in ("held_tokens", "held_probs", "held_k_tokens", "held_k_probs", "held_logits"):
+                self.checkpoint[k].clear()
             return off_tokens, off_text
 
         if requeue_now:
@@ -1072,7 +1345,8 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
+            # Every token accepted so far counts, new_tokens restarts from zero in each segment
+            "rq_new_tokens": self.rq_new_tokens + self.new_tokens,
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "rejected_draft_tokens": self.rejected_draft_tokens,
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
@@ -1081,6 +1355,7 @@ class Job:
             "sam": self.sam,
             "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
             "filters_suspended": self.filters_suspended,
+            "mtp_last_hidden": self.mtp_last_hidden,
         }
 
         serial_number = self.serial_number
@@ -1104,6 +1379,7 @@ class Job:
             max_rq_tokens = self.orig_max_rq_tokens,
             stop_on_loop = self.stop_on_loop,
             rq_state = rq_state,
+            readout = self.readout,
             retain_decision_prefix = self.retain_decision_prefix,
             checkpoint = self.checkpoint_enabled,
         )
@@ -1127,16 +1403,35 @@ class Job:
         self.generator = generator
         self.pagetable = generator.pagetable
         self.skips = 0
+        if self.readout_root is not None and self.readout_root.validate(self, generator):
+            self.readout_serial = True
+            self.readout_fallback = "Image-bearing tails use serial readout"
+            if not self.readout_root.fallback_logged:
+                logging.getLogger(__name__).info(self.readout_fallback)
+                self.readout_root.fallback_logged = True
+        if self.readout_root_tokens is not None:
+            length = len(self.sequences[0].sequence_ids)
+            suffix_pages = (length % PAGE_SIZE + self.readout_root_tokens + PAGE_SIZE - 1) // PAGE_SIZE
+            if (length + PAGE_SIZE - 1) // PAGE_SIZE + suffix_pages > self.pagetable.max_pages:
+                self.readout_fallback = "Exact root and child exceed cache capacity"
+            elif length + self.readout_root_tokens > generator.model.config.max_position_embeddings:
+                self.readout_fallback = "Exact root and child exceed model context"
+            elif self.embeddings and self.sequences[0].multimodal_mask[-1]:
+                self.readout_fallback = "Image-ending roots use serial readout"
+            else:
+                self.readout_reserved_pages = suffix_pages
 
         # No explicit limit: whatever the cache can still hold beyond the prompt, less the default
         # requeue budget's headroom below so that budget still fits the cache exactly
         if self.max_new_tokens is None:
             self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
-                                      - 1 - self.generator.num_draft_tokens)
+                                      - 1 - self.generator.max_draft_tokens)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.readout:
             self.max_rq_tokens = 0
+            self.rq_margin = 0
+            self.rq_headroom = 0
         elif self.max_rq_tokens is not None:
             if len(self.sequences) == 1:
                 boundary = self.generator.recurrent_checkpoint_interval \
@@ -1144,32 +1439,36 @@ class Job:
                 x = len(self.sequences[0].input_ids)
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
+            # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
+            # resumes the next segment with nothing to replay. A speculative window writes K/V past that
+            # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
+            # (early by the window misses the boundary and replays up to a checkpoint interval; early by
+            # a page shortens every segment by a page and requeues up to twice as often)
+            self.rq_margin = 0
+            self.rq_headroom = self.generator.max_draft_tokens
+            self.max_rq_tokens = min(self.max_rq_tokens, self.max_new_tokens + 1)
+            needed = len(self.sequences[0].input_ids) + self.max_new_tokens + 1 + self.rq_headroom
+            assert needed <= self.generator.max_total_tokens, \
+                f"Job requires {needed} tokens (only {self.generator.max_total_tokens} available) and cannot be enqueued"
         else:
             # Default budget: the whole response plus one speculative window past the limit
-            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.max_draft_tokens
+            self.rq_margin = self.generator.max_draft_tokens
+            self.rq_headroom = 0
 
         # Compatibility checks
-        if self.banned_strings and self.generator.recurrent_cache is not None:
-            # SWA states rewind in place, but only within their guaranteed rollback window (one page). Since the
-            # matched text is tokenized by the model and its boundaries are ambiguous, require a margin below that
-            # limit for the reference tokenization of each banned string. States without in-place rollback rewind
-            # by restoring a past checkpoint and replaying, which has no length limit.
-            guaranteed = getattr(self.generator.cache.recurrent_state_cls, "guaranteed_rollback", 0)
-            if guaranteed:
-                max_ref_tokens = guaranteed - 8
-                for s in self.banned_strings:
-                    ref_tokens = self.generator.tokenizer.encode(s).shape[-1]
-                    assert ref_tokens <= max_ref_tokens, \
-                        f"Banned string tokenizes to {ref_tokens} tokens, exceeding the maximum of " \
-                        f"{max_ref_tokens} supported by this model's recurrent state rollback: {s!r}"
+        self._check_banned_strings(self.banned_strings)
 
         # Hash full pages of input IDs
         all_unique_hashes = set()
         all_unique_pages = 0
         for seq in self.sequences:
-            unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens)
-            if self.generator.mtp_draft:
-                seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
+            unique_hashes, unique_pages = seq.prepare(
+                self.prefix_token is not None, self.max_rq_tokens + self.rq_headroom,
+                self.readout_root.page_hashes if self.readout_root is not None else ())
+            if self.readout_root is not None or (self.generator.mtp_draft and self.rq_mtp_hidden is None):
+                seq.max_cached_pages = self.readout_root.position // PAGE_SIZE if self.readout_root is not None \
+                    else max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
                 cached_hashes = seq.page_hashes[:seq.max_cached_pages]
                 omitted_pages = len(seq.page_hashes) - len(cached_hashes)
                 all_unique_hashes.update(cached_hashes)
@@ -1177,7 +1476,7 @@ class Job:
             else:
                 all_unique_hashes |= unique_hashes
                 all_unique_pages += unique_pages
-        self.all_unique_hashes = list(all_unique_hashes)
+        self.all_unique_hashes = all_unique_hashes
 
         # Make sure the request can potentially fit
         total_pages = len(self.all_unique_hashes) + all_unique_pages
@@ -1199,12 +1498,16 @@ class Job:
             self.held_probs = SeqTensor((1, 0), dtype = torch.float, seq_dim = -1)
             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
             self.full_completion = ""
-            self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
+            self.sam = ext.BC_SAM() if (generator.ngram_match_min or generator.hybrid_draft_tokens) else None
+            self.sam_match = None   # (sequence length, match begin, match end) of the last suffix-automaton query
+            self.corpus_cursor = generator.ngram_corpus.cursor() if generator.ngram_corpus else None
 
         self.time_enqueue = time.time()
 
         # Prepare MRoPE embeddings
-        if self.embeddings and generator.model.caps.get("mrope"):
+        if self.readout_root is not None and not self.readout_serial:
+            self.alt_rope_offset = self.readout_root.alt_rope_offset
+        elif self.embeddings and generator.model.caps.get("mrope"):
             ids = self.sequences[0].sequence_ids.torch()
             freqs, offset = generator.model.g_rope.get_mrope_freqs(
                 ids,
@@ -1216,16 +1519,19 @@ class Job:
         else:
             self.alt_rope_freqs = None
             self.alt_rope_offset = 0
+        if self.readout_root is not None:
+            self.readout_root.children.add(self)
 
 
     def current_new_pages_required(self):
         new_pages = 0
-        for h in self.all_unique_hashes:
-            if h not in self.pagetable.referenced_pages:
-                new_pages += 1
+        reusable = set()
         for s in self.sequences:
-            omitted_pages = 0 if s.max_cached_pages is None else len(s.page_hashes) - s.max_cached_pages
-            new_pages += s.new_unique_pages + omitted_pages
+            hashes = s.cached_page_hashes(
+                self.pagetable, self.generator.recurrent_cache if self.readout_root is None else None)
+            reusable.update(hashes)
+            new_pages += s.new_unique_pages + len(s.page_hashes) - len(hashes)
+        new_pages += sum(h not in self.pagetable.referenced_pages for h in reusable)
         return new_pages
 
 
@@ -1286,7 +1592,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks
+            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks or self.readout_root is not None
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -1412,7 +1718,8 @@ class Job:
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
                     "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                    "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
+                    "recurrent_states": [self.recurrent_state.target] if self.recurrent_state is not None and
+                                        self.recurrent_state.target is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
@@ -1436,7 +1743,7 @@ class Job:
                 # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
                 # tokens map to the same state slots with the same values, leaving state content intact.
                 if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
-                    self.recurrent_state.rewind(self.recurrent_state.position - prefill_end)
+                    self.recurrent_state.rewind_to(prefill_end)
 
                 seq.kv_position = prefill_end
 
@@ -1457,6 +1764,16 @@ class Job:
                     if pfp_b > pfp_a:
                         page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
                     page.can_revert = False
+
+                # A full prompt page that prefill (re)built rather than reusing by hash (the page MTP leaves
+                # out of the cached prefix so one real token runs) was allocated under a random hash; give
+                # it its content hash now, or every page completed after it chains off the random one and
+                # no later checkpoint is findable by a requeued job
+                for local_idx in range(p0, p2):
+                    page = seq.allocated_pages[local_idx]
+                    if self.readout_root is None and page.kv_position == PAGE_SIZE and local_idx < len(seq.page_hashes) \
+                            and page.phash != seq.page_hashes[local_idx]:
+                        self.hash_completed_page(seq, local_idx)
 
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
@@ -1481,12 +1798,15 @@ class Job:
 
 
     def _prefill_draft(self, seq, input_ids, params):
+        recurrent_states = [self.recurrent_state.draft] if self.recurrent_state is not None and \
+                           self.recurrent_state.draft is not None else None
         if self.generator.dflash_draft:
             self.generator.draft_model.update_kv_from_target(
                 target_hidden = params.get("export_states"),
                 cache = self.generator.draft_cache,
                 params = {"block_table": seq.block_index_tensor,
-                          "cache_seqlens": params["cache_seqlens"]},
+                          "cache_seqlens": params["cache_seqlens"],
+                          "recurrent_states": recurrent_states},
             )
         elif self.generator.draft_model:
             if self.generator.mtp_draft:
@@ -1504,7 +1824,8 @@ class Job:
                 params = {"target_hidden": shifted_hidden, "attn_mode": "flash_attn",
                           "block_table": seq.block_index_tensor, "cache": self.generator.draft_cache,
                           "cache_seqlens": params["cache_seqlens"],
-                          "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None},
+                          "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                          "recurrent_states": recurrent_states},
             )
 
 
@@ -1517,45 +1838,66 @@ class Job:
             "attn_mode": "flash_attn", "block_table": seq.block_index_tensor,
             "cache": self.generator.cache,
             "cache_seqlens": torch.tensor([start], dtype = torch.int32),
-            "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
+            "recurrent_states": [self.recurrent_state.target] if self.recurrent_state is not None and
+                                self.recurrent_state.target is not None else None,
             "indexed_embeddings": self.embeddings, "inv_freq": self.alt_rope_freqs,
         }
         if self.generator.draft_model:
             params.update(self.generator.draft_model.draft_verifier_params)
         features = self.generator.model.forward_features(input_ids = ids, params = params)
         self._prefill_draft(seq, ids, params)
+        self.commit_readout_tokens(ids)
+        return self.receive_readout(features)
 
-        page_index, offset = divmod(start, PAGE_SIZE)
-        page = seq.allocated_pages[page_index]
-        page.sequence[:, offset:offset + 1].copy_(ids)
-        page.kv_position = offset + 1
-        page.can_revert = False
-        seq.kv_position = start + 1
-        if page.kv_position == PAGE_SIZE:
-            previous = seq.allocated_pages[page_index - 1].phash if page_index else None
-            page.prev_hash = previous
-            phash = tensor_hash_checksum(page.sequence, previous)
-            shared = self.pagetable.referenced_pages.get(phash)
-            if shared is not None and shared is not page:
-                page.sub_ref()
-                shared.add_ref(page.access_serial)
-                seq.allocated_pages[page_index] = shared
-                seq.build_block_index_tensor()
-            else:
-                duplicate = self.pagetable.unreferenced_pages.get(phash)
-                if duplicate is not None:
-                    duplicate.clear()
-                page.update_hash(phash)
-            if self.generator.recurrent_cache is not None:
-                self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
-        self.is_finished = True
-        return {
+
+    def commit_readout_tokens(self, ids):
+        seq = self.sequences[0]
+        pos, end = seq.kv_position, seq.kv_position + ids.shape[-1]
+        while pos < end:
+            pi, offset = divmod(pos, PAGE_SIZE)
+            page = seq.allocated_pages[pi]
+            assert page.ref_count == 1
+            count = min(end - pos, PAGE_SIZE - offset)
+            page.sequence[:, offset:offset + count].copy_(ids[:, pos - seq.kv_position:pos - seq.kv_position + count])
+            page.kv_position = offset + count
+            page.prev_hash = seq.allocated_pages[pi - 1].phash if pi else None
+            page.can_revert = False
+            pos += count
+        seq.kv_position = end
+
+
+    def receive_readout(self, features):
+        seq = self.sequences[0]
+        result = {
             "job": self, "stage": "readout", "eos": True, "serial": self.serial_number,
-            "identifier": self.identifier, "features": features[0, -1].clone(),
-            "sequence_ids": seq.sequence_ids.torch().clone(),
+            "identifier": self.identifier, "features": features[0, -1],
             "cached_tokens": self.cached_pages * PAGE_SIZE + self.cached_tokens,
             "forwarded_tokens": len(seq.sequence_ids) - self.cached_pages * PAGE_SIZE - self.cached_tokens,
         }
+        if self.readout_root_tokens is not None:
+            result["readout_root"] = None
+        first = self.readout_root.position // PAGE_SIZE if self.readout_root is not None else (seq.kv_position - 1) // PAGE_SIZE
+        # Private branch pages stay unique until completion, so admission credits only physical allocations.
+        for pi in range(first, len(seq.allocated_pages)):
+            if seq.allocated_pages[pi].kv_position == PAGE_SIZE:
+                self.hash_completed_page(seq, pi)
+        if self.generator.recurrent_cache is not None and seq.kv_position % PAGE_SIZE == 0:
+            self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+        if self.readout_root_tokens is not None and self.readout_fallback is None:
+            snapshot = self.generator.recurrent_cache.pin(self.recurrent_state) if self.recurrent_state is not None else None
+            if self.recurrent_state is not None and snapshot is None:
+                self.readout_fallback = "Exact root exceeds recurrent checkpoint budget"
+            else:
+                try:
+                    result["readout_root"] = ReadoutRoot(self, snapshot)
+                except Exception:
+                    if snapshot is not None:
+                        self.generator.recurrent_cache.unpin(snapshot)
+                    raise
+        if self.readout_fallback is not None:
+            result["readout_fallback"] = self.readout_fallback
+        self.is_finished = True
+        return result
 
 
     def allocate_pages(self):
@@ -1570,11 +1912,15 @@ class Job:
         # Pages matching any of the job's own prompt hashes must not be taken to serve this same allocation's
         # cache misses (e.g. when resuming a partially evicted sequence, the misses at the front must not
         # cannibalize the surviving pages further along the chain)
-        protected_hashes = set(self.all_unique_hashes)
+        protected_hashes = self.all_unique_hashes
 
         for seq in self.sequences:
             allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
-                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache, protected_hashes)
+                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache if self.readout_root is None else None,
+                                   protected_hashes)
+            if self.readout_root is not None:
+                self.readout_private_pages = len(seq.allocated_pages) - self.readout_root.position // PAGE_SIZE
+                self.readout_root.active_pages += self.readout_private_pages
 
             # Free the previous state before acquiring a new one. A bare assignment drops
             # the handle without returning the slot index to the cache free list, so every
@@ -1583,15 +1929,39 @@ class Job:
             # models) a few such jobs exhaust the pool. The rewind path already does this
             # correctly via free_recurrent_state().
             self.free_recurrent_state()
-            if self.generator.recurrent_cache is not None:
+            if self.readout_root is not None:
+                root = self.readout_root
+                if root.snapshot is not None:
+                    self.recurrent_state = self.generator.recurrent_state_from_stashed(root.snapshot, root.position)
+                offset = root.position % PAGE_SIZE
+                if offset:
+                    page = seq.allocated_pages[root.position // PAGE_SIZE]
+                    for cache in (self.generator.cache, self.generator.draft_cache):
+                        if cache is not None:
+                            cache.copy_page(cache, root.pages[-1].page_index, page.page_index, offset)
+                    page.sequence[:, :offset].copy_(root.ids[:, -offset:])
+                    page.kv_position = offset
+                    page.can_revert = False
+                seq.kv_position = root.position
+                self.cached_tokens += offset
+                if root.mtp_carry is not None:
+                    seq.mtp_carry_hidden = root.mtp_carry.clone()
+                    self.mtp_last_hidden = seq.mtp_carry_hidden
+            elif self.generator.recurrent_cache is not None:
                 if stashed_recurrent_state is None:
-                    self.recurrent_state = self.generator.cache.get_new_state()
+                    self.recurrent_state = self.generator.new_recurrent_state()
                 else:
-                    self.recurrent_state = self.generator.cache.new_from_stashed(
+                    self.recurrent_state = self.generator.recurrent_state_from_stashed(
                         stashed_recurrent_state,
                         position = cached_pages * PAGE_SIZE,
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
+
+            # A requeued segment that resumes at its last token keeps drafting from the previous segment's MTP state
+            if self.rq_mtp_hidden is not None:
+                if seq.kv_position == len(seq.sequence_ids) - 1:
+                    self.mtp_last_hidden = self.rq_mtp_hidden
+                self.rq_mtp_hidden = None
 
             # Metrics
             self.cached_pages += cached_pages
@@ -1605,6 +1975,13 @@ class Job:
             if seq.allocated_pages is not None:
                 self.pagetable.deallocate_pages(seq.allocated_pages)
                 seq.allocated_pages = []
+        if self.readout_root is not None:
+            self.readout_root.active_pages -= self.readout_private_pages
+            self.readout_private_pages = 0
+            self.readout_root.detach(self)
+        if self.readout_reservation_active:
+            self.generator.readout_reserved_pages -= self.readout_reserved_pages
+            self.readout_reservation_active = False
 
 
     def prepare_sampling_past_ids(self):
@@ -1721,15 +2098,49 @@ class Job:
             self.recurrent_state = None
 
 
+    def suffix_match(self, seq: torch.Tensor):
+        """(begin, end) of the earlier occurrence of the longest suffix of seq found by the job's suffix
+        automaton; end - begin is the match length. The automaton only accepts new tokens, so a second query
+        over the same sequence in one round (n-gram draft, then hybrid draft) reuses the first answer"""
+        n = seq.shape[-1]
+        if self.sam_match is not None and self.sam_match[0] == n:
+            return self.sam_match[1], self.sam_match[2]
+        beg, end = self.sam.accept_tensor(seq)
+        self.sam_match = (n, beg, end)
+        return beg, end
+
+
+    def get_hybrid_draft(self, length: int):
+        """
+        Continuation of the longest suffix match for the hybrid draft: (tokens, match length), with up to
+        `length` tokens following the earlier occurrence of the match. The caller decides whether the match
+        is long enough.
+        """
+        assert self.sam
+        seq = self.sequences[0].sequence_ids.torch()
+        beg, end = self.suffix_match(seq)
+        if end <= beg:
+            return torch.empty((1, 0), dtype = torch.long), 0
+        # The match sits `lag` tokens behind the present, so the continuation in the buffer is at most that
+        # long. A match longer than its lag means the sequence is periodic over it ("A B C A B C A B"), and the
+        # same rule that found it (x[n] = x[n - lag]) extends the continuation past the buffer by repeating
+        # the lag window; a match against distant context has a lag beyond `length` and tiles nothing
+        cont = seq[:, end:]
+        lag = cont.shape[-1]
+        if lag < length:
+            cont = cont.repeat(1, -(-length // lag))
+        return cont[:, :length], end - beg
+
+
     def get_ngram_draft(self, draft_length: int):
         """
-        Return speculative draft tokens from the suffix-array n-gram matcher.
+        Return the continuation of the longest live/corpus suffix match.
         """
         assert self.sam
 
         # Update SAM with current history and find longest suffix
         seq = self.sequences[0].sequence_ids.torch()
-        beg, end = self.sam.accept_tensor(seq)
+        beg, end = self.suffix_match(seq)
 
         # Grab continuation after longest match or return empty seq
         if end - beg >= self.generator.ngram_match_min:
@@ -1737,4 +2148,9 @@ class Job:
         else:
             draft = torch.empty((1, 0), dtype = torch.long)
 
+        if self.corpus_cursor is not None:
+            matched, corpus_draft = self.corpus_cursor.draft(seq, self.generator.ngram_match_min, draft_length)
+            # Prefer live context on ties; an exhausted occurrence offers no draft.
+            if corpus_draft.numel() and (not draft.numel() or matched > end - beg):
+                draft = corpus_draft
         return draft

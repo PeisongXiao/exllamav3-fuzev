@@ -76,6 +76,9 @@ cu132 = [
 package-dir = { "" = "." }
 include-package-data = true
 
+[tool.setuptools.packages.find]
+include = ["exllamav3*"]
+
 [tool.setuptools.package-data]
 exllamav3 = [
     "py.typed",
@@ -84,7 +87,7 @@ exllamav3 = [
     "exllamav3_ext/**/*",
     "vendor/fla/LICENSE",
 ]
-"exllamav3.optimized" = ["profile.json", "LICENSE"]
+"exllamav3.optimized" = ["profile.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "exllamav3.version.__version__" }
@@ -142,3 +145,12 @@ explicit = true
 name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
 explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["tools", "_retired", "testlib", "__disk_lru_cache__", ".*"]
+addopts = ["-p", "no:cacheprovider"]
+filterwarnings = [
+    # Triton's code generator on Python 3.14
+    "ignore:AnnAssign.__init__ missing:DeprecationWarning",
+]

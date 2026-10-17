@@ -1,1 +1,1 @@
-__version__ = "1.5.2+fuzev.v1.0"
+__version__ = "1.6.1+fuzev.v1.1"

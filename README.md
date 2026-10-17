@@ -2,9 +2,9 @@
 
 ExLlamaV3 with hooks that let FuZev read the model's final hidden state for
 Choice, yes/no and ordered Score decisions alongside ordinary generation.
-The [FuZev integration](https://github.com/PeisongXiao/fuzev-exllamav3-plugin)
-loads the [decision head](https://huggingface.co/peisongxiao/Qwen3.8-Flash-Next-FuZev)
-and serves the API. The [FuZev index](https://github.com/PeisongXiao/fuzev)
+The [FuZev integration](https://github.com/PeisongXiao/fuzev-exllamav3-plugin/tree/v1.1)
+loads the [decision head](https://huggingface.co/peisongxiao/Qwen3.8-Flash-Next-FuZev/tree/v1.1)
+and serves the API. The [FuZev index](https://github.com/PeisongXiao/fuzev/tree/v1.1)
 describes the components and models.
 
 **Contents**
@@ -14,29 +14,31 @@ describes the components and models.
 - [Prefill Optimizations](#prefill-optimizations)
 - [Changes from upstream](doc/fuzev-fork.md)
 - [Upstream Documentation](#upstream-documentation)
+- [What's New In 1.1](#whats-new-in-11)
 
 ## Install This Fork
 
-Version `1.5.2+fuzev.v1.0`, based on upstream ExLlamaV3 `1.5.2`.
+Version `1.6.1+fuzev.v1.1`, based on upstream ExLlamaV3 `1.6.1`.
 
 Requirements:
 
-- Python 3.10.11 or later (tested with 3.12)
+- Python 3.11 or later (tested with 3.12)
 - An NVIDIA CUDA GPU with a compatible driver
-- A CUDA toolkit whose `nvcc` CUDA version is compatible with the selected Torch build
+- A CUDA toolkit 12.4 or newer whose `nvcc` CUDA version is compatible with the selected Torch build
+- NVIDIA driver 550.54.14 or newer on Linux (551.61 or newer on Windows) for
+  CUDA graph replay; older drivers run without CUDA graphs
 - Python development headers and a C++ compiler
 
-Follow the canonical [environment setup](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#create-an-environment)
-and [ExLlamaV3 engine build](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#exllamav3).
-The guide also covers CUDA 13 headers, other toolkit layouts, build
-architectures and [release wheels](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#local-release-wheels).
+Follow the canonical [environment setup](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/install.md#create-an-environment)
+and [ExLlamaV3 engine build](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/install.md#exllamav3).
+The guide also covers CUDA 13 headers, other toolkit layouts and build architectures.
 
 ## Add Decisions
 
 In the same active environment, install the shared runtime and ExLlamaV3
 integration with the canonical
-[decision integration step](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#exllamav3-with-exl3).
-Then follow the [integration guide](https://github.com/PeisongXiao/fuzev-exllamav3-plugin)
+[decision integration step](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/install.md#exllamav3-with-exl3).
+Then follow the [integration guide](https://github.com/PeisongXiao/fuzev-exllamav3-plugin/tree/v1.1)
 for the head bundle, model configuration and server startup.
 
 The integration submits decision jobs to the Generator that serves generation,
@@ -44,25 +46,28 @@ reusing its tokenizer, caches and scheduler. It can also add decision routes to
 an application's existing Generator.
 
 - [Generator readout](doc/fuzev-generator.md): the Python integration.
-- [API guide](https://github.com/PeisongXiao/fuzev/blob/main/docs/api.md): the client contract, image input and retained prefixes.
+- [API guide](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/api.md): the client contract, image input and retained prefixes.
 
 ## Prefill Optimizations
 
 Prefill optimizations are on by default when a model is built.
 
-- **Chunk size:** pass `max_chunk_size=8192` to `model.load()` and the
+- **Chunk size:** pass `max_chunk_size=32768` to `model.load()` and the
   Generator to reach the measured throughput.
 - **Plain path:** set `EXLLAMAV3_NO_PREFILL_OPTIMIZATIONS=1` before the process
-  builds its first model. It applies to the whole process.
+  creates its first model config. It applies to the whole process.
 - **GPU fallback:** if FlashInfer's gated-delta-network (GDN) prefill does not
-  support the GPU, GDN layers use the native scan on that device.
+  support the GPU, GDN layers use the native scan on that device. The
+  sparse-attention and expert kernels likewise use ExLlamaV3's native path on a
+  device or input shape they do not support.
 - **Tuning:** call `enable_prefill_optimizations(options)` before model
-  construction. See the [optimization guide](doc/fuzev-fork.md#prefill-optimizations).
+  construction, or pass the options to `fuzev-native --prefill-profile`. See the
+  [optimization guide](doc/fuzev-fork.md#prefill-optimizations).
 
 Written by Peisong Xiao for ExLlamaV3; derived files retain turboderp's MIT
 copyright ([LICENSE](LICENSE)). Serving behavior and quality are in the
-[FuZev integration](https://github.com/PeisongXiao/fuzev/blob/main/docs/integration.md) and
-[benchmarks](https://github.com/PeisongXiao/fuzev/blob/main/docs/benchmarks.md).
+[FuZev integration](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/integration.md) and
+[benchmarks](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/benchmarks.md).
 
 ## Upstream Documentation
 
@@ -233,10 +238,11 @@ installations once the venv is active, `python convert.py -i ...`
 
 **Build environment variables**
 
-- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for
+- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for 
 compilation. Set this to a reasonable value like 4 in that case.
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch
 will build/load it at runtime instead.
+- `EXLLAMA_EXT_LINEINFO`, `EXLLAMA_EXT_COMPRESS`: see [doc/env_vars.md](doc/env_vars.md).
 
 ## Examples
 
@@ -383,22 +389,57 @@ supporters (🐈❤️!) The following projects in particular deserve a special 
 
 ## Limitations
 
-FuZev v1.0 is an experimental research release. ExLlamaV3 readout currently
+FuZev v1.1 is an experimental research release. ExLlamaV3 readout currently
 supports Generators without tensor parallelism; multi-GPU layer splits are
-untested. The [API limitations](https://github.com/PeisongXiao/fuzev/blob/main/docs/api.md#limitations) describe option
+untested. The [API limitations](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/api.md#limitations) describe option
 counts and image scope.
 
-Images are experimental. Retained prefixes from generation requests that
+Images are experimental (run at your own risk). Retained prefixes from generation requests that
 included an image keep the image embeddings with the accepted tokens.
-Image requests have CPU-only coverage; visual decision quality is limited
-([benchmarks](https://github.com/PeisongXiao/fuzev/blob/main/docs/benchmarks.md#full-held-out-visual-comparison)).
+Visual decision quality is limited
+([benchmarks](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/benchmarks.md#experimental-image-decisions)).
 
 The prefill optimizations are tuned and tested on GB10 with
 Qwen3.8-Flash-Next EXL3; on other GPUs or models, compare against
 `EXLLAMAV3_NO_PREFILL_OPTIMIZATIONS=1`.
 
 Tested on NVIDIA GB10 (Python 3.12, PyTorch 2.13.0+cu130).
-See [source-installation checks](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#verified-source-installations).
+See [source-installation checks](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/install.md#verified-source-installations).
 The [fork limitations](doc/fuzev-fork.md#limitations) give the results scope,
 run-to-run variation and the CUDA 12.4 driver requirement for CUDA graph
 argument patching.
+
+## What's New In 1.1
+
+Upgrade steps for the whole release are in
+[Upgrading from 1.0](https://github.com/PeisongXiao/fuzev/blob/v1.1/docs/releases.md#upgrading-from-10).
+
+- The fork rebases on upstream ExLlamaV3 `1.6.1` from `1.5.2`.
+- Prefill optimizations live in the engine modules, and `exllamav3.optimized`
+  holds their options (`settings.py`, `profile.json`); its `install`, `hooks`
+  and `vendor` modules are removed
+  ([Change Map](doc/fuzev-fork.md#change-map)).
+- The prefill profile adds `prefill_chunk` (default 32,768 tokens) and
+  `hc_cache_tables`, and `moe_batch_cap` defaults to 4 (8 in 1.0).
+  `fuzev-native --prefill-profile` sets any option at launch
+  ([option table](doc/fuzev-fork.md#prefill-optimizations)).
+- Request-scoped readout roots keep a decision's consumed query prefix; option
+  tails run as root children, up to `max_batch_size` in one batched forward.
+  Concurrent decisions over the same prefix each keep their own root and reuse
+  cached pages up to the last restorable recurrent checkpoint
+  ([readout roots](doc/fuzev-generator.md#request-scoped-readout-roots),
+  [measurements](doc/fuzev-fork.md#decision-root-measurements)).
+- Readout events carry `features`, `cached_tokens` and `forwarded_tokens`;
+  `sequence_ids` comes only with generation results that set
+  `retain_decision_prefix=True` ([Generator readout](doc/fuzev-generator.md)).
+- `Linear.select_outputs` builds a compact projection of the requested label
+  rows, which the decision integration uses for label scores
+  ([Change Map](doc/fuzev-fork.md#change-map)).
+- `AsyncGenerator` runs inference on a dedicated owner thread.
+  `enqueue_async` admits an `AsyncJob` made with
+  `AsyncJob.from_job(generator, job, enqueue=False)`, and `run_on_owner` runs
+  another model call on that thread, without blocking the event loop
+  ([Change Map](doc/fuzev-fork.md#change-map)).
+- On drivers without the CUDA 12.4 parameter-info APIs, CUDA graphs turn off
+  with one warning and inference runs eagerly
+  ([fork limitations](doc/fuzev-fork.md#limitations)).

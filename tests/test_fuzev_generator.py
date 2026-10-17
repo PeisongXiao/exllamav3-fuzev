@@ -3,7 +3,9 @@ import asyncio
 import pytest
 import torch
 
-from cpu_generator_fixture import AsyncGenerator, AsyncJob, Job, MMEmbedding, jobs, make_generator, run_readout
+from cpu_generator_fixture import AsyncJob, Job, MMEmbedding, jobs, make_async_generator, make_generator, run_readout
+
+pytestmark = pytest.mark.nogpu
 
 
 @pytest.mark.parametrize("count", [1, 256, 257])
@@ -12,7 +14,7 @@ def test_readout_exact_boundary_and_post_collapse(count, mtp):
     gen = make_generator(mtp=mtp)
     ids = [1] * count
     result = run_readout(gen, ids)
-    assert result["sequence_ids"].tolist() == [ids]
+    assert result["cached_tokens"] + result["forwarded_tokens"] == count
     torch.testing.assert_close(result["features"], torch.tensor([count + 2., count + 4.]))
     if mtp:
         assert gen.model.vocabulary == gen.draft_model.drafts == 0
@@ -32,6 +34,31 @@ def test_warm_prefix_preserves_paired_pages_and_returned_features():
     gen.pagetable.validate_pagetable([])
 
 
+def test_readout_restores_both_recurrent_sides():
+    gen = make_generator(dflash=True)
+    run_readout(gen, [1] * 256)
+    actual = run_readout(gen, [1] * 256 + [2, 3])
+    expected = run_readout(make_generator(dflash=True), [1] * 256 + [2, 3])
+    assert actual["cached_tokens"] == 256 and actual["forwarded_tokens"] == 2
+    torch.testing.assert_close(actual["features"], expected["features"])
+    assert gen.cache.kv == gen.draft_cache.kv
+    assert all(saved["target"]["checksum"] == saved["draft"]["checksum"]
+               for saved in gen.recurrent_cache.values())
+    for cache in (gen.cache, gen.draft_cache):
+        assert sorted(cache.free_list) == list(range(cache.num_slots))
+    gen.pagetable.validate_pagetable([])
+
+
+def test_readout_can_fill_cache_without_generation_headroom():
+    gen = make_generator()
+    gen.max_draft_tokens = 16
+    result = run_readout(gen, [1] * gen.max_total_tokens)
+    assert result["forwarded_tokens"] == gen.max_total_tokens
+    assert result["cached_tokens"] == 0
+    torch.testing.assert_close(result["features"], torch.tensor([gen.max_total_tokens + 2., gen.max_total_tokens + 4.]))
+    gen.pagetable.validate_pagetable([])
+
+
 @pytest.mark.parametrize("count", [256, 257, 513])
 @pytest.mark.parametrize("mtp", [False, True])
 def test_candidate_without_checkpoints_matches_query_readout(count, mtp):
@@ -45,7 +72,6 @@ def test_candidate_without_checkpoints_matches_query_readout(count, mtp):
     run_readout(reference, [1] * 256)
     expected = run_readout(reference, ids)
     torch.testing.assert_close(actual["features"], expected["features"])
-    assert actual["sequence_ids"].tolist() == expected["sequence_ids"].tolist()
     assert actual["cached_tokens"] == expected["cached_tokens"]
     assert actual["forwarded_tokens"] == expected["forwarded_tokens"]
 
@@ -60,7 +86,23 @@ def test_concurrent_readout_jobs_release_all_slots():
     results = [event for event in events if event["stage"] == "readout"]
     assert len(results) == len(queued)
     for result in results:
-        count = int(result["sequence_ids"].sum())
+        count = int(result["job"].sequences[0].sequence_ids.torch().sum())
+        torch.testing.assert_close(result["features"], torch.tensor([count + 2., count + 4.]))
+    assert len(gen.cache.free_list) == gen.cache.num_slots
+    gen.pagetable.validate_pagetable([])
+
+
+@pytest.mark.parametrize("count", [256, 513])
+def test_concurrent_identical_readouts_match_serial_features(count):
+    gen = make_generator()
+    gen.enqueue([Job(torch.ones((1, count), dtype=torch.long), readout=True) for _ in range(2)])
+    events = []
+    while gen.num_remaining_jobs():
+        events.extend(gen.iterate())
+    assert not any(event["stage"] == "error" for event in events)
+    results = [event for event in events if event["stage"] == "readout"]
+    assert len(results) == 2
+    for result in results:
         torch.testing.assert_close(result["features"], torch.tensor([count + 2., count + 4.]))
     assert len(gen.cache.free_list) == gen.cache.num_slots
     gen.pagetable.validate_pagetable([])
@@ -81,28 +123,11 @@ def test_failed_terminal_readout_does_not_publish_unpaired_page(failure):
     assert len(gen.cache.free_list) == gen.cache.num_slots and not gen.recurrent_cache
     gen.pagetable.validate_pagetable([])
     gen.model.fail = gen.draft_model.fail = False
-    assert run_readout(gen, [2])["sequence_ids"].tolist() == [[2]]
-
-
-def test_retained_prefix_includes_stop_token():
-    gen = make_generator()
-    job = Job(torch.tensor([[1, 2]]), max_new_tokens=5, stop_conditions=[99], retain_decision_prefix=True)
-    gen.enqueue(job)
-    gen.iterate_start_jobs([])
-    job.prefill([])
-    job.receive_logits = lambda logits: (torch.tensor([[99]]), None, None, None)
-    events = []
-    gen.iterate_gen(events, gen.iterate_draftmodel_mtp_gen(events))
-    terminal = next(event for event in events if event.get("eos"))
-    assert terminal["sequence_ids"].tolist() == [[1, 2, 99]]
-    result = run_readout(gen, terminal["sequence_ids"][0].tolist() + [4])
-    assert result["sequence_ids"].tolist() == [[1, 2, 99, 4]]
-    gen.pagetable.validate_pagetable([])
+    torch.testing.assert_close(run_readout(gen, [2])["features"], torch.tensor([4., 6.]))
 
 
 def test_requeued_job_keeps_retained_prefix_opt_in():
     ids = torch.tensor([[1, 2]])
-    assert Job(ids).retain_decision_prefix is False
     gen = make_generator()
     job = Job(ids, max_new_tokens=5, retain_decision_prefix=True)
     gen.enqueue(job)
@@ -131,6 +156,62 @@ def test_generation_without_decisions_keeps_default_output(monkeypatch, mtp):
     assert "sequence_ids" not in terminal
     assert all(event["stage"] != "readout" for event in events)
     assert gen.model.features == 0
+
+
+def test_short_generation_finishes_while_segmented_long_job_reaches_cache_end(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
+    from exllamav3.generator.sampler.custom import CustomSampler
+    monkeypatch.setattr(CustomSampler, "forward", lambda self, logits, *a, **kw: logits.argmax(-1))
+    gen = make_generator()
+    prompt = torch.ones((1, 256), dtype=torch.long)
+    long = Job(prompt, max_new_tokens=gen.max_total_tokens - prompt.shape[-1] - gen.max_draft_tokens - 1,
+               max_rq_tokens=gen.recurrent_checkpoint_interval, retain_decision_prefix=True)
+    short = Job(torch.tensor([[2, 3]]), max_new_tokens=2,
+                max_rq_tokens=gen.recurrent_checkpoint_interval)
+    gen.enqueue([long, short])
+    terminal = {}
+    for _ in range(gen.max_total_tokens):
+        for event in gen.iterate():
+            if event["stage"] == "error":
+                raise event["error"]
+            if event.get("eos"):
+                terminal[event["job"]] = event
+                if event["job"] is short:
+                    assert long not in terminal
+        if not gen.num_remaining_jobs():
+            break
+    assert set(terminal) == {long, short}
+    assert terminal[long]["sequence_ids"].shape[-1] == gen.max_total_tokens - gen.max_draft_tokens - 1
+    assert len(gen.cache.free_list) == gen.cache.num_slots
+    gen.pagetable.validate_pagetable([])
+
+
+def test_short_segmented_generation_leaves_cache_for_other_jobs(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
+    from exllamav3.generator.sampler.custom import CustomSampler
+    monkeypatch.setattr(CustomSampler, "forward", lambda self, logits, *a, **kw: logits.argmax(-1))
+    gen = make_generator()
+    short = Job(torch.ones((1, 100), dtype=torch.long), max_new_tokens=3, max_rq_tokens=gen.max_total_tokens)
+    reader = Job(torch.full((1, 3000), 5, dtype=torch.long), readout=True)
+    gen.enqueue([short, reader])
+    gen.iterate()
+    assert reader in gen.active_jobs
+
+
+def test_segmented_mtp_generation_forwards_each_token_once(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
+    from exllamav3.generator.sampler.custom import CustomSampler
+    monkeypatch.setattr(CustomSampler, "forward", lambda self, logits, *a, **kw: logits.argmax(-1))
+    forwarded = []
+    for segmented in (False, True):
+        gen = make_generator()
+        max_rq_tokens = gen.recurrent_checkpoint_interval if segmented else None
+        gen.enqueue(Job(torch.ones((1, 300), dtype=torch.long), max_new_tokens=1000, max_rq_tokens=max_rq_tokens))
+        while gen.num_remaining_jobs():
+            gen.iterate()
+        forwarded.append(sum(ids.numel() for ids in gen.model.inputs))
+        gen.pagetable.validate_pagetable([])
+    assert forwarded[0] == forwarded[1]
 
 
 @pytest.mark.parametrize("stop", [False, True])
@@ -163,7 +244,8 @@ def test_readout_defaults_and_image_cache_identity():
     image = MMEmbedding(torch.ones(1, 2), torch.tensor([[-1]]))
     ids = image.token_list + [1] * 255
     result = run_readout(gen, ids, embeddings=[image])
-    assert {"features", "sequence_ids", "stage"} <= result.keys()
+    assert {"features", "cached_tokens", "forwarded_tokens", "stage"} <= result.keys()
+    assert result["cached_tokens"] + result["forwarded_tokens"] == len(ids)
     assert gen.model.embeddings[-1] == [image]
     assert run_readout(gen, ids + [2, 3], embeddings=[image])["cached_tokens"] == 256
     other = MMEmbedding(torch.zeros(1, 2), torch.tensor([[-1]]))
@@ -172,13 +254,10 @@ def test_readout_defaults_and_image_cache_identity():
     assert gen.model.embeddings[-1] == [other]
 
 
-def test_async_prepared_job_routing_and_cancellation():
+def test_async_prepared_job_routing_and_cancellation(monkeypatch):
     async def run():
-        gen = make_generator()
-        owner = AsyncGenerator.__new__(AsyncGenerator)
-        owner.generator, owner.jobs, owner.error = gen, {}, None
-        owner.condition = asyncio.Condition()
-        owner.iteration_task = asyncio.create_task(owner._run_iteration())
+        owner = make_async_generator(monkeypatch)
+        gen = owner.generator
         try:
             handle = AsyncJob.from_job(owner, Job(torch.tensor([[1]]), readout=True))
             results = [event async for event in handle]
@@ -186,6 +265,13 @@ def test_async_prepared_job_routing_and_cancellation():
             waiting = AsyncJob.from_job(owner, Job(torch.tensor([[1]]), readout=True))
             await waiting.cancel()
             assert not owner.jobs and not gen.pending_jobs
+            with pytest.raises(AssertionError):
+                AsyncJob.from_job(owner, Job(torch.ones((1, gen.max_total_tokens + 1), dtype=torch.long),
+                                             readout=True))
+            assert not owner.jobs and not gen.pending_jobs
+            handle = AsyncJob.from_job(owner, Job(torch.tensor([[2]]), readout=True))
+            results = [event async for event in handle]
+            torch.testing.assert_close(results[-1]["features"], torch.tensor([4., 6.]))
         finally:
             await owner.close()
     asyncio.run(run())

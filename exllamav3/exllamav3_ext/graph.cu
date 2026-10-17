@@ -1,5 +1,6 @@
 #include <Python.h>
 #include <cstring>
+#include <atomic>
 #include "graph.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -8,14 +9,50 @@
 #include "util.cuh"
 #include "cuda_drv.h"
 #include "quant/exl3_devctx.cuh"
+#include "cublas_handle.cuh"
 
 //#define GRAPHDEBUG 1
+
+// EXL3_GRAPHS=0 disables graph capture everywhere: every graphed site then runs its C++ launch sequence
+// eagerly on each call (the same kernels in the same order, as on the uncaptured first run). Default off
+// on ROCm: the HIP runtime launches a graph node no faster than a plain kernel, so replay only saves the
+// per-kernel host submission, which is within noise of the per-graph submission; meanwhile every
+// instantiated exec holds a 2 MB device kernarg pool that grows with each parameter update until the
+// exec is destroyed. On CUDA the graphs are kept, where they are measurably faster
+static std::atomic<bool> graph_param_info_unavailable{false};
+
+static bool graphs_disabled()
+{
+    static const bool v = [] {
+        const char* e = getenv("EXL3_GRAPHS");
+#if defined(USE_ROCM)
+        return !(e && *e == '1');
+#else
+        return e && *e == '0';
+#endif
+    }();
+    return v || graph_param_info_unavailable.load();
+}
+
+static void disable_graph_param_info()
+{
+    if (!graph_param_info_unavailable.exchange(true))
+        TORCH_WARN("CUDA graph argument patching requires a CUDA 12.4 or newer driver; "
+                   "running eager. EXL3_GRAPHS=0 disables CUDA graphs explicitly.");
+}
+
+bool Graph::is_disabled() const
+{
+    return disabled || graphs_disabled();
+}
 
 Graph::Graph()
 {
     ready = false;
     ready_to_record = false;
-    disabled = false;
+    disabled = graphs_disabled();
+    capture_stream = nullptr;
+    capture_active = false;
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;
@@ -23,126 +60,187 @@ Graph::Graph()
 
 Graph::~Graph()
 {
-    if (graph) cudaGraphDestroy(graph);
-    if (graph_exec) cudaGraphExecDestroy(graph_exec);
+    capture_abort();
 }
 
 cudaStream_t Graph::capture_begin()
 {
-    #ifdef GRAPHDEBUG
-        printf("Begin graph capture\n");
-    #endif
+    TORCH_CHECK(!capture_stream && !capture_active, "Graph: capture already active");
+    if (graph || graph_exec) capture_abort();
+    // Surface an earlier asynchronous fault before starting a new capture.
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+    // The thread's cuBLAS handle (and torch's workspace for it) must exist before capture: a slot
+    // warmed on another thread (the loader's) may capture on this one, and creating the handle
+    // allocates, which a thread-local capture forbids. A no-op once the handle exists
+    (void) at::cuda::getCurrentCUDABlasHandle();
+    try
+    {
+        AT_CUDA_CHECK(cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking));
+        AT_CUDA_CHECK(cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeThreadLocal));
+        capture_active = true;
+        return capture_stream;
+    }
+    catch (...)
+    {
+        capture_abort();
+        throw;
+    }
+}
 
-    // Make sure nothing is pending
-    cudaDeviceSynchronize();
-
-    // Create capture stream
-    cuda_check(cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking));
-
-    // Begin capture
-    cuda_check(cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeThreadLocal));
-    return capture_stream;
+void Graph::capture_abort() noexcept
+{
+    // End even an invalidated capture. Preserve the original exception if cleanup fails.
+    if (capture_stream)
+    {
+        if (capture_active)
+        {
+            cudaGraph_t abandoned = nullptr;
+            (void) cudaStreamEndCapture(capture_stream, &abandoned);
+            capture_active = false;
+            if (abandoned && abandoned != graph) (void) cudaGraphDestroy(abandoned);
+        }
+        (void) cudaStreamDestroy(capture_stream);
+        capture_stream = nullptr;
+    }
+    if (graph_exec) (void) cudaGraphExecDestroy(graph_exec);
+    if (graph) (void) cudaGraphDestroy(graph);
+    graph_exec = nullptr;
+    graph = nullptr;
+    ready = false;
+    ready_to_record = false;
+    need_cublas = false;
+    graph_sites.clear();
+    graph_node_sites.clear();
+    nodes.clear();
+    node_params.clear();
+    node_params_drv.clear();
+    node_is_driver.clear();
+    node_args.clear();
+    current_values.clear();
+    node_needs_update.clear();
 }
 
 void Graph::capture_end()
 {
-    // End capture
-    cuda_check(cudaStreamEndCapture(capture_stream, &graph));
-    cuda_check(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
-    //inspect_graph();
-
-    // Get graph nodes
-    size_t num_nodes;
-    cudaGraphGetNodes(graph, nullptr, &num_nodes);
-    nodes.resize(num_nodes);
-    cudaGraphGetNodes(graph, nodes.data(), &num_nodes);
-
-    // Store copies of all node param structures
-    node_params.resize(num_nodes);
-    node_params_drv.resize(num_nodes);
-    node_is_driver.resize(num_nodes);
-    node_args.resize(num_nodes);
-    node_needs_update.resize(num_nodes);
-    for (int i = 0; i < num_nodes; ++i)
-        node_needs_update[i] = false;
-
-    int n = 0;
-    int c = 0;
-    while (true)
+    TORCH_CHECK(capture_stream && capture_active, "Graph: no active capture");
+    try
     {
-        cudaGraphNodeType t{};
-        cudaGraphNodeGetType(nodes[n], &t);
+        // End capture. An invalidated capture is still ended by this call.
+        cudaError_t end_status = cudaStreamEndCapture(capture_stream, &graph);
+        capture_active = false;
+        AT_CUDA_CHECK(end_status);
+        AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        //inspect_graph();
 
-        // Node type: kernel
-        if (t == cudaGraphNodeTypeKernel)
+        // Get graph nodes
+        size_t num_nodes;
+        AT_CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &num_nodes));
+        nodes.resize(num_nodes);
+        AT_CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &num_nodes));
+
+        // Store copies of all node param structures
+        node_params.resize(num_nodes);
+        node_params_drv.resize(num_nodes);
+        node_is_driver.resize(num_nodes);
+        node_args.resize(num_nodes);
+        node_needs_update.resize(num_nodes);
+        for (int i = 0; i < num_nodes; ++i)
+            node_needs_update[i] = false;
+
+        int n = 0;
+        int c = 0;
+        while (c < graph_sites.size())
         {
-            // Nodes captured from driver-API launches (Triton cubins) can't be read through the
-            // runtime API; fall back to the driver API for those. The func handle recorded via
-            // record_param is the CUfunction in that case, so matching works the same way
-            void* node_func;
-            node_is_driver[n] = 0;
-            cudaError_t e = cudaGraphKernelNodeGetParams(nodes[n], &node_params[n]);
-            if (e == cudaSuccess)
-                node_func = (void*) node_params[n].func;
-            else
+            TORCH_CHECK(n < num_nodes, "Graph recording failed");
+            cudaGraphNodeType t{};
+            AT_CUDA_CHECK(cudaGraphNodeGetType(nodes[n], &t));
+
+            // Node type: kernel
+            if (t == cudaGraphNodeTypeKernel)
             {
-                (void) cudaGetLastError();
-                cuda_check_drv(CudaDrv::instance().graph_kernel_node_get_params((CUgraphNode) nodes[n], &node_params_drv[n]));
-                node_is_driver[n] = 1;
-                node_func = (void*) node_params_drv[n].func;
-            }
-
-            size_t first_site = graph_node_sites.size();
-            for(; c < graph_sites.size(); c++)
-            {
-                void* func = std::get<0>(graph_sites[c]);
-                if (func != node_func) break;
-
-                int param_id     = std::get<1>(graph_sites[c]);
-                int param_offset = std::get<2>(graph_sites[c]);
-                int param_size   = std::get<3>(graph_sites[c]);
-
-                graph_node_sites.push_back(std::tuple<int, int, int, int>(n, param_id, param_offset, param_size));
-                if (param_id == GP_end) { c++; break; }
-            }
-
-            if (graph_node_sites.size() != first_site)
-            {
-                own_node_params(n);
-                for (size_t s = first_site; s < graph_node_sites.size(); ++s)
+                // Nodes captured from driver-API launches (Triton cubins) can't be read through the
+                // runtime API; fall back to the driver API for those. The func handle recorded via
+                // record_param is the CUfunction in that case, so matching works the same way
+                void* node_func;
+                node_is_driver[n] = 0;
+                cudaError_t e = cudaGraphKernelNodeGetParams(nodes[n], &node_params[n]);
+                if (e == cudaSuccess)
+                    node_func = (void*) node_params[n].func;
+                else
                 {
-                    auto [node_idx, param_id, param_offset, param_size] = graph_node_sites[s];
-                    if (param_id == GP_end) continue;
-                    TORCH_CHECK(param_offset >= 0 && param_offset < node_args[n].values.size() &&
-                                param_size > 0 && param_size <= sizeof(void*) &&
-                                param_size <= node_args[n].values[param_offset].size(),
-                                "Graph recording failed: invalid kernel parameter size or index");
+                    (void) cudaGetLastError();
+                    cuda_check_drv(CudaDrv::instance().graph_kernel_node_get_params((CUgraphNode) nodes[n], &node_params_drv[n]));
+                    node_is_driver[n] = 1;
+                    node_func = (void*) node_params_drv[n].func;
                 }
+
+                size_t first_site = graph_node_sites.size();
+                for(; c < graph_sites.size(); c++)
+                {
+                    void* func = std::get<0>(graph_sites[c]);
+                    if (func != node_func) break;
+
+                    int param_id     = std::get<1>(graph_sites[c]);
+                    int param_offset = std::get<2>(graph_sites[c]);
+                    int param_size   = std::get<3>(graph_sites[c]);
+
+                    graph_node_sites.push_back(std::tuple<int, int, int, int>(n, param_id, param_offset, param_size));
+                    if (param_id == GP_end) { c++; break; }
+                }
+#if !defined(USE_ROCM)
+                if (graph_node_sites.size() != first_site)
+                {
+                    if (!own_node_params(n))
+                    {
+                        capture_abort();
+                        disabled = true;
+                        return;
+                    }
+                    for (size_t s = first_site; s < graph_node_sites.size(); ++s)
+                    {
+                        auto [node_idx, param_id, param_offset, param_size] = graph_node_sites[s];
+                        if (param_id == GP_end) continue;
+                        TORCH_CHECK(param_offset >= 0 && param_offset < node_args[n].values.size() &&
+                                    param_size > 0 && param_size <= sizeof(void*) &&
+                                    param_size <= node_args[n].values[param_offset].size(),
+                                    "Graph recording failed: invalid kernel parameter size or index");
+                    }
+                }
+#endif
             }
-        }
 
-        n++;
-        if (c == graph_sites.size()) break;
-        if (n == num_nodes) TORCH_CHECK(false, "Graph recording failed");
-    };
+            n++;
+            if (c == graph_sites.size()) break;
+            if (n == num_nodes) TORCH_CHECK(false, "Graph recording failed");
+        };
 
-    // Destroy capture stream
-    cuda_check(cudaStreamDestroy(capture_stream));
+        // Destroy capture stream
+        AT_CUDA_CHECK(cudaStreamDestroy(capture_stream));
+        capture_stream = nullptr;
 
-    // Graph is ready
-    ready = true;
+        // Graph is ready
+        ready = true;
 
-    #ifdef GRAPHDEBUG
-        printf("End graph capture, num_nodes=%d, graph_sites.size()=%d\n", num_nodes, graph_sites.size());
-    #endif
+        #ifdef GRAPHDEBUG
+            printf("End graph capture, num_nodes=%d, graph_sites.size()=%d\n", num_nodes, graph_sites.size());
+        #endif
+    }
+    catch (...)
+    {
+        capture_abort();
+        throw;
+    }
 }
 
 void Graph::record_param(void* kernel, int param_id, int param_offset, int size)
 {
+    TORCH_CHECK(param_id == GP_end || (param_offset >= 0 && size > 0 && size <= sizeof(void*)),
+                "Graph recording failed: invalid kernel parameter size or index");
     graph_sites.push_back(std::tuple<void*, int, int, int>(kernel, param_id, param_offset, size));
 }
 
-void Graph::own_node_params(int node_idx)
+#if !defined(USE_ROCM)
+bool Graph::own_node_params(int node_idx)
 {
     void**& params = node_is_driver[node_idx] ?
         node_params_drv[node_idx].kernelParams : node_params[node_idx].kernelParams;
@@ -156,11 +254,18 @@ void Graph::own_node_params(int node_idx)
         size_t offset, size;
         if (node_is_driver[node_idx])
         {
-            TORCH_CHECK(CudaDrv::instance().func_get_param_info,
-                "CUDA graph argument patching needs a driver with cuFuncGetParamInfo (CUDA 12.4 or newer)");
+            if (!CudaDrv::instance().func_get_param_info)
+            {
+                disable_graph_param_info();
+                return false;
+            }
             CUresult r = CudaDrv::instance().func_get_param_info(node_params_drv[node_idx].func, i, &offset, &size);
             if (r == CUDA_ERROR_INVALID_VALUE) break;  // end of the kernel signature
-            cuda_check_drv(r);
+            if (r != CUDA_SUCCESS)
+            {
+                disable_graph_param_info();
+                return false;
+            }
         }
         else
         {
@@ -170,32 +275,34 @@ void Graph::own_node_params(int node_idx)
                 (void) cudaGetLastError();
                 break;
             }
-            cuda_check(r);
+            if (r != cudaSuccess)
+            {
+                (void) cudaGetLastError();
+                disable_graph_param_info();
+                return false;
+            }
         }
+        TORCH_CHECK(size > 0 && params[i], "Graph recording failed: invalid kernel argument storage");
         const char* src = (const char*) params[i];
         args.values.emplace_back(src, src + size);
     }
     args.ptrs.reserve(args.values.size());
     for (auto& value : args.values) args.ptrs.push_back(value.data());
     params = args.ptrs.data();
+    return true;
 }
+#endif
 
 void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
 {
     if (need_cublas)
     {
-        cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-        cublasSetStream(cublas_handle, stream);
-        cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-        int device;
-        cudaGetDevice(&device);
-        void* ws = DevCtx::instance().get_ws(device);
-        cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+        (void) exl3_cublas_handle(stream);
     }
 
     int p = 0;
     int n = 0;
-    while (true)
+    while (p < params.size())
     {
         if (std::get<1>(graph_node_sites[n]) == std::get<0>(params[p]))
         {

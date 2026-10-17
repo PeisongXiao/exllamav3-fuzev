@@ -24,9 +24,14 @@ Weights that would not fit the reconstruct scratch budget (EXL3_MOE_RECON_MB) sh
 
 from __future__ import annotations
 import os
+import logging
 import numpy as np
 import torch
 from ..ext import exllamav3_ext as ext
+from ..util.device_copy import host_to_device
+from ..optimized import settings
+
+_prefill_fallback_warned = set()
 
 RECON_BATCH = max(1, int(os.environ.get("EXL3_MOE_RECON_BATCH", 16)))
 # Padded rows per group (B * cmax): bounds the gathered input / intermediate slabs
@@ -107,13 +112,56 @@ def batch_cap(dims_g, dims_u, dims_d):
     return max(1, min(RECON_BATCH, (RECON_MB << 20) // per))
 
 
+def max_group_rows(dims_u, dims_d):
+    """Row cap for an expert to join the batched tier (see RECON_TILES / RECON_MAX_ROWS)"""
+    if RECON_MAX_ROWS > 0:
+        return RECON_MAX_ROWS
+    if RECON_TILES > 0:
+        n_min = min(dims_u[1], dims_d[1])
+        return max(128, (RECON_TILES * 128 * 128) // n_min)
+    return 1 << 30
+
+
+def effective_limits(dims_g, dims_u, dims_d, *, folded, resident, prefill_optimized):
+    cap, rows = batch_cap(dims_g, dims_u, dims_d), max_group_rows(dims_u, dims_d)
+    if prefill_optimized and folded and resident and settings.CONFIG["moe_impl"] == "folded-hot":
+        cap = min(cap, settings.CONFIG["moe_batch_cap"])
+        rows = settings.CONFIG["moe_max_rows"]
+    return cap, rows
+
+
+def worst_case_bytes(dims_g, dims_u, dims_d, interm_fp32: bool, assignments: int,
+                     slot_mode: bool, limits=None) -> int:
+    """Upper bound on one group's per-call temporaries (weight slabs, gathered input,
+    gate / up slabs, activation, and the fp32 down slab unless it lands in the caller's slot
+    scratch) for `assignments` routed rows in total: the autosplit loader's worst-case
+    measure. Group rows are bounded by the batch cap, the row cap and the padding budget.
+    Depends on the projection shapes only, so the TP allocator can take it before load"""
+    ku, nu = dims_u[0], dims_u[1]
+    kd, nd = dims_d[0], dims_d[1]
+    kg, ng = (dims_g[0], dims_g[1]) if dims_g else (0, 0)
+    cap, max_rows = limits if limits is not None else (batch_cap(dims_g, dims_u, dims_d),
+                                                    max_group_rows(dims_u, dims_d))
+    cmax = min(max_rows, assignments)
+    rows = min(cap * cmax, RECON_ROWS, int(assignments * PAD_MAX) + cmax)
+    total = 2 * cap * (max(kg * ng, kd * nd) + ku * nu)              # scratch1 + Wu
+    total += rows * ku * 2                                           # gathered input
+    idt = 4 if interm_fp32 else 2
+    total += rows * nu * idt * (2 if dims_g else 1)                  # u (+ g)
+    if interm_fp32:
+        total += rows * nu * 2                                       # fp16 activation
+    if not slot_mode:
+        total += rows * nd * 4                                       # down slab
+    return total
+
+
 class BatchReconLayer:
     """Per-layer constants for the batched path: projection dims, codebook flags, activation,
     and the stacked per-expert sign vectors. Trellis pointer tables are supplied per call (they
     differ between GPU-resident and streamed experts)."""
 
     def __init__(self, dims_g, dims_u, dims_d, cb_g, cb_u, cb_d, activation, act_limit, device,
-                 scales, folded = None, interm_fp32 = False):
+                 scales, folded = None, interm_fp32 = False, prefill_optimized = False, resident = False):
         # dims: (k, n, K); cb: (mcg, mul1); scales: per projection ("g", "u", "d") a pair of
         # lists of per-expert suh (k) and svh (n) half tensors, stacked here into [E, dim]
         # tables
@@ -121,22 +169,18 @@ class BatchReconLayer:
         self.dims_g, self.dims_u, self.dims_d = dims_g, dims_u, dims_d
         self.cb_g, self.cb_u, self.cb_d = cb_g, cb_u, cb_d
         act = _ACT_IDX[activation] if isinstance(activation, int) else activation
+        self.activation = act
+        self.prefill_optimized = prefill_optimized
         self.act_call = (_ACT_CALLS_GATED if self.gated else _ACT_CALLS_GATELESS)[act]
         self.act_limit = float(act_limit or 0.0)
         self.device = device
-        self.cap = batch_cap(dims_g, dims_u, dims_d)
-        if RECON_MAX_ROWS > 0:
-            self.max_rows = RECON_MAX_ROWS
-        elif RECON_TILES > 0:
-            n_min = min(dims_u[1], dims_d[1])
-            self.max_rows = max(128, (RECON_TILES * 128 * 128) // n_min)
-        else:
-            self.max_rows = 1 << 30
         # Static per-expert trellis pointer tables ([E] int64, device) when the experts are
         # resident: the per-group tables are then a device-side gather by expert id instead of
         # a host-built list. Streamed experts (VRAM slot addresses) pass pointers per call.
         self.ptr_tables = None
         self.folded = RECON_FOLDED if folded is None else folded
+        self.cap, self.max_rows = effective_limits(dims_g, dims_u, dims_d, folded=self.folded,
+                                                   resident=resident, prefill_optimized=prefill_optimized)
         # fp32 gate / up outputs (models whose intermediates overflow fp16, e.g. gemma4): the
         # activation kernels take fp32 in and write the fp16 activation the down GEMM consumes
         self.interm_fp32 = interm_fp32
@@ -155,26 +199,10 @@ class BatchReconLayer:
                 self.scales[p] = (_stacked(suh), _stacked(svh))
 
     def worst_case_bytes(self, assignments: int, slot_mode: bool) -> int:
-        """Upper bound on one group's per-call temporaries (weight slabs, gathered input,
-        gate / up slabs, activation, and the fp32 down slab unless it lands in the caller's slot
-        scratch) for `assignments` routed rows in total: the autosplit loader's worst-case
-        measure. Group rows are bounded by the batch cap, the row cap and the padding budget"""
-        ku, nu, _ = self.dims_u
-        kd, nd, _ = self.dims_d
-        kg, ng = (self.dims_g[0], self.dims_g[1]) if self.gated else (0, 0)
-        cmax = min(self.max_rows, assignments)
-        rows = min(self.cap * cmax, RECON_ROWS, int(assignments * PAD_MAX) + cmax)
-        total = 2 * self.cap * (max(kg * ng, kd * nd) + ku * nu)        # scratch1 + Wu
-        total += rows * ku * 2                                           # gathered input
-        idt = 4 if self.interm_fp32 else 2
-        total += rows * nu * idt * (2 if self.gated else 1)              # u (+ g)
-        if self.interm_fp32:
-            total += rows * nu * 2                                       # fp16 activation
-        if not slot_mode:
-            total += rows * nd * 4                                       # down slab
-        return total
+        return worst_case_bytes(self.dims_g, self.dims_u, self.dims_d, self.interm_fp32, assignments,
+                                slot_mode, limits=(self.cap, self.max_rows))
 
-    def _linear(self, x, W, p, ids, out_n, out_dtype = torch.half, out = None):
+    def _linear(self, x, W, p, ids, out_n, out_dtype = torch.half, out = None, *, optimized=False):
         """x: [B, cmax, k] input slab, W: [B, k, n] -> [B, cmax, n]. Unfolded: the same
         arithmetic as the per-expert path (had_r_128 with fp16 pre-scale in, fp16/fp32 post-
         scale out), with the per-expert scale rows picked from the stacked tables"""
@@ -185,7 +213,15 @@ class BatchReconLayer:
             ext.had_r_128_batch(x.view(B * cmax, k), xh.view(B * cmax, k), suh, None, ids, cmax, 1.0)
             x = xh
         y = out if out is not None else torch.empty((B, cmax, out_n), dtype = out_dtype, device = x.device)
-        ext.hgemm_batched(x, W, y)
+        if (optimized and x.is_cuda and not torch.version.hip
+                and x.dtype == W.dtype == torch.half
+                and y.dtype in (torch.half, torch.float)
+                and x.is_contiguous() and W.is_contiguous() and y.is_contiguous()):
+            from .moe_batch_recon_triton import gemm
+            if not gemm(x, W, y, tile=settings.CONFIG["bmm_tile"]):
+                ext.hgemm_batched(x, W, y)
+        else:
+            ext.hgemm_batched(x, W, y)
         if not self.folded:
             y2 = y.view(B * cmax, out_n)
             ext.had_r_128_batch(y2, y2, None, svh, ids, cmax, 1.0)
@@ -223,6 +259,55 @@ class BatchReconLayer:
         B = len(counts)
         assert B <= self.cap
         cmax = max(counts)
+        optimized = (self.prefill_optimized and settings.CONFIG["moe_impl"] == "folded-hot"
+                     and y_ext.shape[0] - 1 >= settings.CONFIG["prefill_min_rows"])
+        supported = (y_ext.is_cuda and not torch.version.hip and y_ext.dtype == torch.half
+                     and self.folded and self.gated and not self.interm_fp32
+                     and self.act_limit == 0 and self.activation == "silu"
+                     and ptrs is None and out_slab is not None
+                     and self.dims_g[:2] == self.dims_u[:2])
+        if supported:
+            kd, nd, kdown = self.dims_d
+            supported = out_slab.shape == (B * cmax, nd) and kd == self.dims_u[1]
+        if optimized and supported:
+            from .moe_batch_recon_triton import gate_up
+
+            k, n, ku = self.dims_u
+            meta = host_to_device(torch.from_numpy(np.array([ids, starts, counts], dtype=np.int64)),
+                                  y_ext.device)
+            ids_d = meta[0]
+            pg, pu, pd = (table.index_select(0, ids_d) for table in self.ptr_tables)
+            ar = torch.arange(cmax, device=y_ext.device)
+            source = torch.where(ar[None, :] < meta[2, :, None],
+                                 meta[1, :, None] + ar[None, :], tok_ext.shape[0] - 1)
+            tokens = tok_ext.index_select(0, source.reshape(-1))
+            scratch = torch.empty(B * max(k * n, kd * nd), dtype=torch.half, device=y_ext.device)
+            wu = torch.empty((B, k, n), dtype=torch.half, device=y_ext.device)
+            wg = scratch[:B * k * n].view(B, k, n)
+            self._recon(wu, pu, "u", ids_d, ku, self.cb_u)
+            self._recon(wg, pg, "g", ids_d, self.dims_g[2], self.cb_g)
+            u = torch.empty((B, cmax, n), dtype=torch.half, device=y_ext.device)
+            if not gate_up(y_ext, tokens, wg, wu, u):
+                x = y_ext.index_select(0, tokens).view(B, cmax, k)
+                g = self._linear(x, wg, "g", ids_d, n)
+                self._linear(x, wu, "u", ids_d, n, out=u)
+                self.act_call(g.view(B * cmax, n), u.view(B * cmax, n), u.view(B * cmax, n), self.act_limit)
+                del x, g
+            del wg, wu
+            wd = scratch[:B * kd * nd].view(B, kd, nd)
+            self._recon(wd, pd, "d", ids_d, kdown, self.cb_d)
+            self._linear(u, wd, "d", ids_d, nd, out_dtype=torch.float,
+                         out=out_slab.view(B, cmax, nd), optimized=optimized)
+            return
+        if optimized and ptrs is None and y_ext.device not in _prefill_fallback_warned:
+            _prefill_fallback_warned.add(y_ext.device)
+            reason = ("platform" if not y_ext.is_cuda or torch.version.hip else
+                      "dtype" if y_ext.dtype != torch.half or self.interm_fp32 else
+                      "activation" if not self.gated or self.activation != "silu" or self.act_limit else
+                      "weight layout" if not self.folded else "shape or output layout")
+            logging.getLogger(__name__).warning(
+                "Optimized MoE gather on %s does not support this %s; using native gather/reconstruction",
+                y_ext.device, reason)
         A = tok_ext.shape[0] - 1
         dev = y_ext.device
         ku, nu, Ku = self.dims_u
@@ -240,7 +325,7 @@ class BatchReconLayer:
             for i, pl in enumerate(ptrs):
                 if pl is not None:
                     meta_h[3 + i] = pl
-        meta = torch.from_numpy(meta_h).to(dev, non_blocking = True)
+        meta = host_to_device(torch.from_numpy(meta_h), dev)
         ids_d = meta[0]
         if ptrs is not None:
             ptr_g, ptr_u, ptr_d = meta[3], meta[4], meta[5]
@@ -265,13 +350,13 @@ class BatchReconLayer:
         idt = torch.float if self.interm_fp32 else torch.half
         Wu = torch.empty((B, ku, nu), dtype = torch.half, device = dev)
         self._recon(Wu, ptr_u, "u", ids_d, Ku, self.cb_u)
-        u = self._linear(x, Wu, "u", ids_d, nu, out_dtype = idt)
+        u = self._linear(x, Wu, "u", ids_d, nu, out_dtype = idt, optimized=optimized)
         del Wu
         if self.gated:
             Kg = self.dims_g[2]
             Wg = scratch1[:B * kg * ng].view(B, kg, ng)
             self._recon(Wg, ptr_g, "g", ids_d, Kg, self.cb_g)
-            g = self._linear(x, Wg, "g", ids_d, ng, out_dtype = idt)
+            g = self._linear(x, Wg, "g", ids_d, ng, out_dtype = idt, optimized=optimized)
             g2, u2 = g.view(B * cmax, ng), u.view(B * cmax, nu)
         else:
             g2 = u2 = u.view(B * cmax, nu)
@@ -292,9 +377,10 @@ class BatchReconLayer:
         # per layer, no copy). Otherwise accumulate here
         if out_slab is not None:
             assert nd == out_slab.shape[1], "slot scratch width must match the down projection"
-            self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float, out = out_slab.view(B, cmax, nd))
+            self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float,
+                         out = out_slab.view(B, cmax, nd), optimized=optimized)
             return
-        d = self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float)
+        d = self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float, optimized=optimized)
         d2 = d.view(B * cmax, nd)
         ho = out_ext.shape[1]
         if DETERMINISTIC:

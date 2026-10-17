@@ -105,7 +105,7 @@ void BC_GatedMLP::run_bszN
 
     Graph& g = graph_bszN[graphidx];
 
-    if (g.disabled || (!g.ready && !g.ready_to_record))
+    if (g.is_disabled() || (!g.ready && !g.ready_to_record))
     {
         run_bszN_gr(x, d, num_tokens, nullptr);
         g.ready_to_record = true;
@@ -114,9 +114,13 @@ void BC_GatedMLP::run_bszN
     {
         if (!g.ready)
         {
-            g.capture_begin();
+            GraphCapture capture(g);
             run_bszN_gr(x, d, num_tokens, &g);
-            g.capture_end();
+            if (!capture.finish())
+            {
+                run_bszN_gr(x, d, num_tokens, nullptr);
+                return;
+            }
         }
 
         std::vector<PPTR> args;
@@ -194,7 +198,7 @@ void BC_MLP::run_bsz1
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+    if (graph_bsz1.is_disabled() || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
     {
         run_bsz1_gr(x, d, nullptr);
         graph_bsz1.ready_to_record = true;
@@ -203,9 +207,13 @@ void BC_MLP::run_bsz1
     {
         if (!graph_bsz1.ready)
         {
-            graph_bsz1.capture_begin();
+            GraphCapture capture(graph_bsz1);
             run_bsz1_gr(x, d, &graph_bsz1);
-            graph_bsz1.capture_end();
+            if (!capture.finish())
+            {
+                run_bsz1_gr(x, d, nullptr);
+                return;
+            }
         }
 
         std::vector<PPTR> args;

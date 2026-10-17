@@ -228,17 +228,18 @@ class Sequence:
         self.mtp_carry_hidden = None
 
 
-    def prepare(self, has_prefix_token: bool, max_new_tokens: int):
-        self.page_hashes = []
-        unique_hashes = set()
+    def prepare(self, has_prefix_token: bool, max_new_tokens: int, known_hashes: tuple = ()):
+        # known_hashes: chained hashes of the leading full pages (a readout child passes its root's)
+        self.page_hashes = list(known_hashes)
+        unique_hashes = set(known_hashes)
 
         max_len = len(self.sequence_ids) + max_new_tokens
         if has_prefix_token: max_len += 1
         context_pages = (len(self.sequence_ids) - 1) // PAGE_SIZE
         total_pages = (max_len + PAGE_SIZE - 1) // PAGE_SIZE
 
-        r_hash = None
-        for i in range(context_pages):
+        r_hash = known_hashes[-1] if known_hashes else None
+        for i in range(len(known_hashes), context_pages):
             # TODO: profile/optimize hash function
             page_ids = self.sequence_ids.torch_slice(i * PAGE_SIZE, (i + 1) * PAGE_SIZE)
             assert page_ids.shape[-1] == PAGE_SIZE
@@ -255,16 +256,28 @@ class Sequence:
             dtype = torch.int32,
         )
 
+    def cached_page_hashes(self, pagetable, recurrent_cache):
+        hashes = self.page_hashes[:self.max_cached_pages]
+        if recurrent_cache is None:
+            return hashes
+        # Replay writes K/V again. Only the complete prefix ending at a restorable
+        # checkpoint can be shared; everything after it must be private.
+        resumable = 0
+        for pi, phash in enumerate(hashes):
+            if (pagetable.get_live_page(phash) is None and
+                    (pagetable.cpu_tier is None or phash not in pagetable.cpu_tier)):
+                break
+            if phash in recurrent_cache:
+                resumable = pi + 1
+        return hashes[:resumable]
+
     def allocate_pages(
         self,
         pagetable: PageTable,
         recurrent_cache: None | RecurrentCache,
         protected_hashes: set | None = None,
     ):
-        if self.max_cached_pages is None:
-            page_hashes = self.page_hashes
-        else:
-            page_hashes = self.page_hashes[:self.max_cached_pages]
+        page_hashes = self.cached_page_hashes(pagetable, recurrent_cache)
         new_unique_pages = self.new_unique_pages + len(self.page_hashes) - len(page_hashes)
 
         # If recurrent model, find logest recurrent prefix
@@ -789,6 +802,9 @@ class PageTable:
 
         # Check job reference counts
         refcounts = [0] * self.max_pages
+        for root in self.generator.readout_roots:
+            for page in root.pages:
+                refcounts[page.page_index] += 1
         for job in active_jobs:
             for seq in job.sequences:
                 for page in seq.allocated_pages:
@@ -824,7 +840,7 @@ class PageTable:
 
     def defrag(self, debug = False):
 
-        if not self.generator.enable_defrag:
+        if self.generator.readout_roots or not self.generator.enable_defrag:
             return
 
         # Defragment once job queue is empty and all pages have been touched at least once

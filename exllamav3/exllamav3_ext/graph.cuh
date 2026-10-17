@@ -65,6 +65,7 @@ enum GraphedParams
     GP_conv1d_slots,
     GP_gdn_rule_state,
     GP_gdn_rule_slots,
+    GP_gdn_rule_slots_in,
 
     GP_rope_inv_freq,
     GP_rope_position,
@@ -117,7 +118,7 @@ public:
     // runtime API ("invalid device function"); their params live here instead
     std::vector<CUDA_KERNEL_NODE_PARAMS> node_params_drv;
     std::vector<char> node_is_driver;
-    // GetParams returns node-owned storage, which must not be modified during replay.
+    // CUDA GetParams storage is copied before any replay updates; HIP keeps its native storage.
     struct KernelArgs
     {
         std::vector<std::vector<char>> values;
@@ -127,21 +128,41 @@ public:
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
 
+    bool capture_active;
     bool need_cublas;
     bool ready;
     bool ready_to_record;
     bool disabled;
+    bool is_disabled() const;
 
     Graph();
     ~Graph();
 
     cudaStream_t capture_begin();
     void capture_end();
+    // Best effort, no throwing. Call on the thread/device that began capture.
+    void capture_abort() noexcept;
 
     void record_param(void* kernel, int param_id, int param_offset, int size = 8);
-    void own_node_params(int node_idx);
+#if !defined(USE_ROCM)
+    bool own_node_params(int node_idx);
+#endif
     void launch(std::vector<PPTR> params, cudaStream_t stream);
 
     void inspect_graph();
 };
 
+
+// Keep capture lifetime on the same thread/device as the launch sequence.
+// All native capture callers use this scope, including failures in run_gr.
+class GraphCapture
+{
+    Graph& owner;
+    bool finished = false;
+public:
+    explicit GraphCapture(Graph& graph) : owner(graph) { owner.capture_begin(); }
+    ~GraphCapture() noexcept { if (!finished) owner.capture_abort(); }
+    GraphCapture(const GraphCapture&) = delete;
+    GraphCapture& operator=(const GraphCapture&) = delete;
+    bool finish() { owner.capture_end(); finished = true; return owner.ready; }
+};

@@ -1,4 +1,5 @@
 import os
+import logging
 import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
@@ -93,15 +94,65 @@ def torch_recurrent_kda(q, k, v, g, beta, state):
 # instead of the chunk. 2048 is also the fastest point (-18% vs one 16k pass, -12% vs one 8k
 # pass on a 5090: better program counts than a long pass, and 1024 already costs +38%)
 _scan_sub_range = int(os.environ.get("EXL3_GDN_SUB_CHUNK", "2048"))
+_flashinfer_unsupported = set()
+_flashinfer_warned = set()
 
 
-def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
+def _flashinfer_scan(q, k, v, g, beta, state, save_state):
+    device = q.device
+    if device in _flashinfer_unsupported:
+        return None
+    if (not q.is_cuda or torch.version.hip or q.shape[0] != 1 or g.ndim != 3
+            or q.dtype not in (torch.float16, torch.bfloat16)):
+        if device not in _flashinfer_warned:
+            _flashinfer_warned.add(device)
+            reason = ("requires CUDA on NVIDIA" if not q.is_cuda or torch.version.hip else
+                      "requires FP16 or BF16 operands" if q.dtype not in (torch.float16, torch.bfloat16) else
+                      "requires batch one and three-dimensional gates")
+            logging.getLogger(__name__).warning(
+                "FlashInfer GDN on %s %s; using the native gated-delta scan", device, reason)
+        return None
+    try:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+        from ...vendor.fla.l2norm import l2norm_fwd
+        initial_state = state
+        if initial_state is None:
+            initial_state = torch.zeros((1, v.shape[2], q.shape[-1], v.shape[-1]),
+                                        device=device, dtype=torch.float32)
+        with torch.cuda.device(device):
+            nq = l2norm_fwd(q.contiguous())[0].squeeze(0).contiguous()
+            nk = l2norm_fwd(k.contiguous())[0].squeeze(0).contiguous()
+            result = chunk_gated_delta_rule(
+                q=nq, k=nk, v=v.squeeze(0).contiguous(),
+                g=g.squeeze(0).float().exp().contiguous(),
+                beta=beta.squeeze(0).float().contiguous(),
+                initial_state=initial_state.transpose(-1, -2).contiguous().float(),
+                output_final_state=save_state,
+                cu_seqlens=torch.arange(2, device=device, dtype=torch.int64) * q.shape[1])
+    except torch.OutOfMemoryError:
+        raise
+    except Exception as error:
+        _flashinfer_unsupported.add(device)
+        logging.getLogger(__name__).warning(
+            "FlashInfer GDN failed on %s (%s); using the native gated-delta scan", device, error)
+        return None
+    if save_state:
+        output, final_state = result
+        return output.to(q.dtype).unsqueeze(0), final_state.transpose(-1, -2).contiguous()
+    return result.to(q.dtype).unsqueeze(0), None
+
+
+def _chunked_scan(fn, q, k, v, g, beta, state, save_state, use_flashinfer=False):
     """
     fn (chunk_gated_delta_rule / chunk_kda) over one batch row in sub-ranges of the sequence.
     q, k: (1, T, H, K); v: (1, T, HV, V); state: (1, HV, K, V) fp32 or None. Returns the
     concatenated output (1, T, HV, V) in fn's output dtype and the final state (None unless
     save_state)
     """
+    if use_flashinfer:
+        result = _flashinfer_scan(q, k, v, g, beta, state, save_state)
+        if result is not None:
+            return result
     T = q.shape[1]
     sub = _scan_sub_range if _scan_sub_range > 0 else T
     if T <= sub:
@@ -134,34 +185,47 @@ def gated_delta_rule_fn(
     v_head_dim: int,
     params: dict = None,
     channelwise_g: bool = False,
+    slots_in: torch.Tensor | None = None,
+    use_flashinfer: bool = False,
 ):
     if params is None:
         params = {}
 
     bsz, seqlen, _ = mixed_qkv.shape
 
-    # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
-    # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
+    # recurrent_state rows: recurrent_slots are the rows the pass writes (and reads, except that
+    # a speculative pass -- history -- reads each row's initial state from slots_in and leaves it
+    # untouched; see GDNState). The chunk kernels take the initial and final state as separate
+    # tensors, so they serve both cases; the CUDA kernel takes slots_in
+    def chunked_rows():
+        rows_out = get_for_device(params, "recurrent_slots_scan", "cpu", None)
+        if rows_out is None:
+            rows_out = buffered_arange(bsz, mixed_qkv.device)
+        rows_in = get_for_device(params, "recurrent_slots_scan_in", "cpu", None) if history else None
+        rows_out = rows_out.tolist()
+        rows_in = rows_in.tolist() if rows_in is not None else rows_out
+        return rows_out, rows_in
+
+    # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for long passes, the
+    # channelwise CUDA recurrent kernel (in-kernel q/k l2norm) otherwise
     if channelwise_g:
-        if seqlen >= num_v_heads and not history:
+        if seqlen >= num_v_heads:
             from ...vendor.fla import chunk_kda
             q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
             q = q.view(bsz, seqlen, -1, k_head_dim)
             k = k.view(bsz, seqlen, -1, k_head_dim)
             v = v.view(bsz, seqlen, -1, v_head_dim)
 
-            recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
-            if recurrent_slots_cpu is None:
-                recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
+            rows_out, rows_in = chunked_rows()
             core_attn_out = []
-            for i, s in enumerate(recurrent_slots_cpu.tolist()):
-                state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+            for i, (so, si) in enumerate(zip(rows_out, rows_in)):
+                state = recurrent_state[si, 0].unsqueeze(0) if recurrent_state is not None else None
                 core_attn, new_state = _chunked_scan(
                     chunk_kda, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
                     state, save_state,
                 )
                 if save_state and state is not None:
-                    state.copy_(new_state)
+                    recurrent_state[so, 0].copy_(new_state.squeeze(0))
                 core_attn_out.append(core_attn)
             return torch.cat(core_attn_out, dim = 0).to(torch.bfloat16)
 
@@ -188,11 +252,12 @@ def gated_delta_rule_fn(
             v_head_dim,
             recurrent_slots,
             history,
+            slots_in,
         )
         return core_attn_out
 
     # Chunked rule
-    if seqlen >= num_v_heads and not history:
+    if seqlen >= num_v_heads:
         from ...vendor.fla import chunk_gated_delta_rule
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
@@ -201,18 +266,16 @@ def gated_delta_rule_fn(
         v = v.view(bsz, seqlen, -1, v_head_dim)
 
         # (Grouped attn supported in fla-core now)
-        recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
-        if recurrent_slots_cpu is None:
-            recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
+        rows_out, rows_in = chunked_rows()
         core_attn_out = []
-        for i, s in enumerate(recurrent_slots_cpu.tolist()):
-            state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+        for i, (so, si) in enumerate(zip(rows_out, rows_in)):
+            state = recurrent_state[si, 0].unsqueeze(0) if recurrent_state is not None else None
             core_attn, new_state = _chunked_scan(
                 chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
-                state, save_state,
+                state, save_state, use_flashinfer=use_flashinfer,
             )
             if save_state and state is not None:
-                state.copy_(new_state)
+                recurrent_state[so, 0].copy_(new_state.squeeze(0))
             core_attn_out.append(core_attn)
 
         core_attn_out = torch.cat(core_attn_out, dim = 0)
@@ -244,6 +307,7 @@ def gated_delta_rule_fn(
             v_head_dim,
             recurrent_slots,
             history,
+            slots_in,
         )
 
     return core_attn_out

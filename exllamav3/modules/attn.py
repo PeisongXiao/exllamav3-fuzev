@@ -8,6 +8,7 @@ from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
@@ -15,7 +16,9 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
+# the cooperative GEMM)
+_qkv_slice_enable = QKV_SLICE
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -230,6 +233,36 @@ class Attention(Module):
         self.key_sinks = key_sinks
         self.sinks = None
 
+        # Runtime and TP bookkeeping; set before the zero-head early return below (forward(), unload()
+        # and the TP import glue touch these on ranks that hold none of this layer's heads)
+        self.cache_layers = []
+        self.tp_cache_lookup = {}
+        self.multi_kv = None
+        self.multi_qg = None
+        self.tp_reduce = False
+        self.dispatch_cache = {}
+        self.bc_attn = {}
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
+
+        self.has_split_cache = False
+
+        # TP-aware span_heads norm support
+        self.tp_span_heads_norm = False
+        self.q_global_dim = 0
+        self.k_global_dim = 0
+
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
+        self.multi_qkv = None
+        self.prealloc_qkvh_1 = None
+        self.prealloc_qkv_out_1 = None
+        self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_carrier = None
+
         if self.num_kv_heads == 0:
             return
 
@@ -387,34 +420,6 @@ class Attention(Module):
             "kv_cache": True
         })
 
-        self.cache_layers = []
-        self.tp_cache_lookup = {}
-        self.multi_kv = None
-        self.multi_qg = None
-        self.tp_reduce = False
-        self.dispatch_cache = {}
-        self.bc_attn = {}
-
-        self.q_norm_tensor = None
-        self.k_norm_tensor = None
-
-        self.has_split_cache = False
-
-        # TP-aware span_heads norm support
-        self.tp_span_heads_norm = False
-        self.q_global_dim = 0
-        self.k_global_dim = 0
-
-        self.prealloc_qgh_1 = None
-        self.prealloc_qg_1 = None
-        self.prealloc_kvh_1 = None
-        self.prealloc_kv_1 = None
-        self.multi_qkv = None
-        self.prealloc_qkvh_1 = None
-        self.prealloc_qkv_out_1 = None
-        self.prealloc_qkv_cptrs_1 = None
-        self.prealloc_qkv_carrier = None
-
 
     @override
     def optimizer_targets(self):
@@ -442,7 +447,7 @@ class Attention(Module):
 
         if self.key_sinks:
             self.sinks = self.config.stc.get_tensor(
-                f"{self.key}.{self.key_sinks}", device, no_defer = True
+                f"{self.key}.{self.key_sinks}", device, no_defer = True, arena = False
             ).float().contiguous()
 
         # Test if K and V proj can be fused
@@ -1044,16 +1049,18 @@ class Attention(Module):
         from ..cache.qsa import QSAPlanes
 
         # Quantized cache, unbounded prefill: the two-pass prefill stages the referenced window
-        # as fp16 K/V in a per-call transient, which spans the whole pool for a job at full
-        # context. The (1, chunk)-at-context-0 measuring pass only sees a chunk of it, so
-        # allocate (and drop) the worst case here for the device budget. QSA bounds its dense
+        # as fp16 K/V in a per-call transient of one fixed size, the pool. The (1, chunk)-at-
+        # context-0 measuring pass runs that allocation like any other prefill chunk, but it
+        # lands here as the same two tensors anyway (K and V scratch of pool_pages pages) so
+        # the budget holds whichever chunk shape the loader measures with. QSA bounds its dense
         # prefill and stages a small window; MLA/DSA caches have their own measure
         if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
             from .attention_fn.triton_paged import _qc_staging
             if _qc_staging == 1:
-                n = 2 * layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
-                t = torch.empty((n,), dtype = torch.half, device = self.device)
-                del t
+                shape = (layer.qk.shape[0], PAGE_SIZE, layer.token_dim)
+                kd = torch.empty(shape, dtype = torch.half, device = self.device)
+                vd = torch.empty(shape, dtype = torch.half, device = self.device)
+                del kd, vd
             return
 
         if self.qsa_indexer is None or not isinstance(layer, QSAPlanes):
@@ -1062,7 +1069,9 @@ class Attention(Module):
         # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
         # page 0, zeroed so the math stays finite
         num_pages = (layer.qk if quant else layer.k).shape[0]
-        t_syn = num_pages * PAGE_SIZE - chunk
+        probe_length = min(num_pages * PAGE_SIZE, self.config.max_position_embeddings)
+        chunk = min(chunk, probe_length)
+        t_syn = probe_length - chunk
         if t_syn + chunk <= self.qsa_indexer.sparse_threshold():
             return   # cache too small to ever reach the sparse regime
         for t in ((layer.qk, layer.qv, layer.sk, layer.sv) if quant else (layer.k, layer.v)):
@@ -1071,6 +1080,7 @@ class Attention(Module):
         layer.pooled[0].zero_()
         p2 = {k2: v2 for k2, v2 in params.items() if k2 not in
               ("dev_cache", "positions", "position_ids")}
+        p2["batch_shape"] = (1, chunk)
         p2["cache_seqlens"] = torch.tensor([t_syn], dtype = torch.int32)
         p2["block_table"] = torch.zeros((1, num_pages), dtype = torch.int32)
         p2["position"] = t_syn
@@ -1164,8 +1174,20 @@ class Attention(Module):
             o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
         else:
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
-            # quantized-cache prefill size its staging to the window instead of the job's pages
+            # quantized-cache prefill dequantize the window instead of the job's pages and size
+            # its fixed staging scratch to that bound instead of the pool
             max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
+            staging_pages = None
+            if self.qsa_indexer is not None:
+                staging_pages = -(-(self.qsa_indexer.sparse_threshold() + seqlen) // PAGE_SIZE)
+            # Prefill-sized chunks otherwise take the bound from the host copy of cache_seqlens when
+            # the caller has one (the generator builds it on the CPU, so no sync): the kernels' fallback
+            # bound is the block table's width plus the chunk, which counts the chunk twice once the
+            # table covers it and can push a short context into the kv-split regime
+            if max_kv_len is None and seqlen > 16:
+                cs_host = params.get("cache_seqlens")
+                if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
+                    max_kv_len = int(cs_host.max())
             o = attn_dispatch(
                 q = q,
                 k = k,
@@ -1184,6 +1206,7 @@ class Attention(Module):
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
                 max_kv_len = max_kv_len,
+                staging_pages = staging_pages,
             )
 
         if self.headwise_gate:

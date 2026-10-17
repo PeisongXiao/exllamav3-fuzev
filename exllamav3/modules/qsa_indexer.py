@@ -259,12 +259,8 @@ class QSAIndexer(Module):
     @staticmethod
     def _workspace(rows: int, numel: int, dtype, tag: str, device):
         from ..util.tensor import g_tensor_cache
-        if rows <= QSAIndexer.STATIC_ROWS:
-            return g_tensor_cache.get_bucketed(device, numel, dtype, tag)
-        # Power-of-two size so the caching allocator reuses the freed block across chunks: the
-        # score width grows with the context, and exact sizes would cache one segment per chunk
-        nb = 1 << max(numel - 1, 0).bit_length()
-        return torch.empty((nb,), dtype = dtype, device = device)[:numel]
+        # Power-of-two per-call size beyond the static rows: the score width grows with the context
+        return g_tensor_cache.get_scratch(device, numel, dtype, tag, rows, QSAIndexer.STATIC_ROWS)
 
     def k_pad(self):
         cr = self.compress_ratio
@@ -442,6 +438,7 @@ class QSAIndexer(Module):
             k.reshape(bsz * seq, attn.num_kv_heads, attn.head_dim).contiguous(),
             v.reshape(bsz * seq, attn.num_kv_heads, attn.head_dim).contiguous(),
             indices, attn.sm_scale,
+            prefill_optimized = self.config.infer_params.prefill_optimizations,
         )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
 
@@ -691,7 +688,15 @@ class QSAIndexer(Module):
         """
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         from ..cache.quant import CacheLayer_quant
+        from ..optimized import settings
         bsz, seq = q.shape[:2]
+        context = None
+        if (self.config.infer_params.prefill_optimizations and bsz == 1
+                and seq >= settings.CONFIG["prefill_min_rows"]):
+            context = {"block_table": block_table[0],
+                       "length": int(cache_seqlens_cpu[0]) + seq,
+                       "budget": self.token_budget, "k_pad": self.k_pad(),
+                       "max_length": self.config.max_position_embeddings}
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
@@ -708,5 +713,7 @@ class QSAIndexer(Module):
             k_arg, v_arg, indices, attn.sm_scale,
             block_table = bt_rows, page_size = page_size,
             qc = qc, n_kv_heads = attn.num_kv_heads,
+            prefill_optimized = self.config.infer_params.prefill_optimizations,
+            prefill_context = context,
         )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
